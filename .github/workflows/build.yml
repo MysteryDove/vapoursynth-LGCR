@@ -15,11 +15,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch VapourSynth headers
-        run: git clone --depth 1 --branch "$VS_TAG" https://github.com/vapoursynth/vapoursynth.git "$RUNNER_TEMP/vs"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Build liblgcr.so (AVX2)
-        run: make VSINCLUDE="$RUNNER_TEMP/vs/include" -j"$(nproc)"
+      - name: Install VapourSynth runtime and test dependencies
+        run: python -m pip install "VapourSynth==79" numpy
+
+      - name: Run correctness gates
+        run: |
+          VSINCLUDE="$(python -c 'import pathlib, vapoursynth; print(pathlib.Path(vapoursynth.__file__).parent / "include")')"
+          make check VSINCLUDE="$VSINCLUDE" PYTHON=python -j"$(nproc)"
+          make asan-check VSINCLUDE="$VSINCLUDE" PYTHON=python -j"$(nproc)"
 
       - uses: actions/upload-artifact@v4
         with:

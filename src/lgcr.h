@@ -187,7 +187,16 @@ BilinAxis buildBilinAxis(const std::vector<float> &pos, int srcN);
 
 // Fast bilinear: 4 direct loads, indices pre-clamped via BilinAxis
 inline float bilinearFast(const Plane &p, int x0, float fx, int y0, float fy) {
+    if (p.w == 1) {
+        const float a = p.row(y0)[0];
+        if (p.h == 1)
+            return a;
+        const float c = p.row(y0 + 1)[0];
+        return a + (c - a) * fy;
+    }
     const float *r0 = p.row(y0) + x0;
+    if (p.h == 1)
+        return r0[0] + (r0[1] - r0[0]) * fx;
     const float *r1 = p.row(y0 + 1) + x0;
     const float a = r0[0], b = r0[1], c = r1[0], d = r1[1];
     return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
@@ -412,6 +421,15 @@ void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
 void blockMatch(const Plane &cur, const Plane &nbr, int blockSize, int search,
                 float tsad, std::vector<int16_t> &mvx, std::vector<int16_t> &mvy,
                 std::vector<float> &conf, int &bw, int &bh);
+
+// Fold a robust, joint-U/V consistency score into the luma match confidence.
+// Motion vectors are in luma pixels and confidence is on the same block grid.
+void applyChromaConsistency(const Plane &curU, const Plane &curV,
+                            const Plane &nbrU, const Plane &nbrV,
+                            int lumaW, int lumaH, int blockSize,
+                            const std::vector<int16_t> &mvx,
+                            const std::vector<int16_t> &mvy,
+                            int bw, int bh, std::vector<float> &conf);
 
 void nediChroma(const Plane &U, const Plane &V, Plane &outU, Plane &outV,
                 const ChromaAxis &ax, const ChromaAxis &ay,

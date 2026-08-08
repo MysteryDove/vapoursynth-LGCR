@@ -378,6 +378,58 @@ void blockMatch(const Plane &cur, const Plane &nbr, int blockSize, int search,
         }
 }
 
+void applyChromaConsistency(const Plane &curU, const Plane &curV,
+                            const Plane &nbrU, const Plane &nbrV,
+                            int lumaW, int lumaH, int blockSize,
+                            const std::vector<int16_t> &mvx,
+                            const std::vector<int16_t> &mvy,
+                            int bw, int bh, std::vector<float> &conf) {
+    const double rw = double(lumaW) / curU.w;
+    const double rh = double(lumaH) / curU.h;
+    std::vector<float> delta;
+    delta.reserve(size_t(std::ceil(blockSize / rw)) *
+                  size_t(std::ceil(blockSize / rh)));
+
+    for (int by = 0; by < bh; ++by) {
+        for (int bx = 0; bx < bw; ++bx) {
+            const size_t bi = size_t(by) * bw + bx;
+            if (conf[bi] <= 0.0f)
+                continue;
+            const int lx0 = bx * blockSize;
+            const int ly0 = by * blockSize;
+            const int lx1 = std::min(lumaW, lx0 + blockSize);
+            const int ly1 = std::min(lumaH, ly0 + blockSize);
+            const int cx0 = std::clamp(int(std::floor(lx0 / rw)), 0, curU.w - 1);
+            const int cy0 = std::clamp(int(std::floor(ly0 / rh)), 0, curU.h - 1);
+            const int cx1 = std::clamp(int(std::ceil(lx1 / rw)), cx0 + 1, curU.w);
+            const int cy1 = std::clamp(int(std::ceil(ly1 / rh)), cy0 + 1, curU.h);
+            const double mx = mvx[bi] / rw;
+            const double my = mvy[bi] / rh;
+
+            delta.clear();
+            for (int cy = cy0; cy < cy1; ++cy) {
+                for (int cx = cx0; cx < cx1; ++cx) {
+                    const int nx = std::clamp(int(std::lround(cx + mx)), 0, nbrU.w - 1);
+                    const int ny = std::clamp(int(std::lround(cy + my)), 0, nbrU.h - 1);
+                    delta.push_back(std::max(std::fabs(curU.at(cx, cy) - nbrU.at(nx, ny)),
+                                             std::fabs(curV.at(cx, cy) - nbrV.at(nx, ny))));
+                }
+            }
+            const size_t mid = delta.size() / 2;
+            std::nth_element(delta.begin(), delta.begin() + mid, delta.end());
+            float median = delta[mid];
+            if ((delta.size() & 1) == 0) {
+                const float lower = *std::max_element(delta.begin(), delta.begin() + mid);
+                median = 0.5f * (lower + median);
+            }
+            const float ratio = median / 0.04f;
+            const float ratio2 = ratio * ratio;
+            const float cconf = 1.0f / (1.0f + ratio2 * ratio2);
+            conf[bi] *= cconf;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // algo=6: constrained detail transfer
 // ---------------------------------------------------------------------------
@@ -571,8 +623,6 @@ void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
                 const float ms = bilinearFast(gm.ms, cxi, cxf, cyi, cyf);
                 g *= 1.0f - msStrength * (1.0f - ms);
             }
-            if (g < 1e-3f)
-                continue;
             const float au = bilinearFast(af.aU, cxi, cxf, cyi, cyf);
             const float av = bilinearFast(af.aV, cxi, cxf, cyi, cyf);
             // Edge normal/coherence from the luma tensor (source-space probe)
@@ -599,10 +649,13 @@ void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
             float ou = ru[ox] + cu;
             float ov = rv[ox] + cv;
             if (clampHull) {
-                ou = std::clamp(ou, bilinearFast(af.mnU, cxi, cxf, cyi, cyf) - ar,
-                                bilinearFast(af.mxU, cxi, cxf, cyi, cyf) + ar);
-                ov = std::clamp(ov, bilinearFast(af.mnV, cxi, cxf, cyi, cyf) - ar,
-                                bilinearFast(af.mxV, cxi, cxf, cyi, cyf) + ar);
+                const float baseU = ru[ox], baseV = rv[ox];
+                const float loU = std::min(baseU, bilinearFast(af.mnU, cxi, cxf, cyi, cyf) - ar);
+                const float hiU = std::max(baseU, bilinearFast(af.mxU, cxi, cxf, cyi, cyf) + ar);
+                const float loV = std::min(baseV, bilinearFast(af.mnV, cxi, cxf, cyi, cyf) - ar);
+                const float hiV = std::max(baseV, bilinearFast(af.mxV, cxi, cxf, cyi, cyf) + ar);
+                ou = std::clamp(ou, loU, hiU);
+                ov = std::clamp(ov, loV, hiV);
             }
             ru[ox] = ou;
             rv[ox] = ov;

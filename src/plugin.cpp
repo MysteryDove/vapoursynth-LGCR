@@ -106,6 +106,26 @@ static void VS_CC sharpenCreate(const VSMap *in, VSMap *out, void *, VSCore *cor
 // VapourSynth glue
 // ---------------------------------------------------------------------------
 
+static void applyFrameChromaSiting(LGCRData &d, const VSVideoFormat *fmt,
+                                   const VSFrame *frame, const VSAPI *vsapi) {
+    if (fmt->subSamplingW == 0)
+        d.shiftX = 0.0;
+    if (fmt->subSamplingH == 0)
+        d.shiftY = 0.0;
+    if (d.locSet)
+        return;
+
+    int err = 0;
+    const int64_t cl = vsapi->mapGetInt(vsapi->getFramePropertiesRO(frame),
+                                        "_ChromaLocation", 0, &err);
+    if (err)
+        return;
+    if (fmt->subSamplingW > 0)
+        d.shiftX = (cl == 0 || cl == 2 || cl == 4) ? -0.5 : 0.0;
+    if (fmt->subSamplingH > 0)
+        d.shiftY = (cl == 2 || cl == 3) ? -0.5 : (cl == 4 || cl == 5) ? 0.5 : 0.0;
+}
+
 static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *instanceData,
                                          void **, VSFrameContext *frameCtx, VSCore *core,
                                          const VSAPI *vsapi) {
@@ -126,17 +146,7 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     // meaningless and must not re-introduce a shift (it made 444->444
     // non-identity even at strength=0).
     LGCRData dloc = *d;
-    if (!dloc.locSet) {
-        int perr = 0;
-        const int64_t cl = vsapi->mapGetInt(vsapi->getFramePropertiesRO(src),
-                                            "_ChromaLocation", 0, &perr);
-        if (!perr) {
-            if (fmt->subSamplingW > 0)
-                dloc.shiftX = (cl == 0 || cl == 2 || cl == 4) ? -0.5 : 0.0;
-            if (fmt->subSamplingH > 0)
-                dloc.shiftY = (cl == 2 || cl == 3) ? -0.5 : (cl == 4 || cl == 5) ? 0.5 : 0.0;
-        }
-    }
+    applyFrameChromaSiting(dloc, fmt, src, vsapi);
     d = &dloc;
 
     const int sw = vsapi->getFrameWidth(src, 0);
@@ -365,6 +375,17 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
 
 static void VS_CC lgcrFree(void *instanceData, VSCore *, const VSAPI *vsapi);
 
+static std::vector<int> temporalFrameNumbers(int n, int nLast, int trad) {
+    std::vector<int> frames;
+    frames.reserve(2 * trad);
+    for (int k = -trad; k <= trad; ++k) {
+        const int fn = std::clamp(n + k, 0, nLast);
+        if (fn != n && std::find(frames.begin(), frames.end(), fn) == frames.end())
+            frames.push_back(fn);
+    }
+    return frames;
+}
+
 static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *instanceData,
                                            void **, VSFrameContext *frameCtx, VSCore *core,
                                            const VSAPI *vsapi) {
@@ -372,12 +393,9 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
     const int trad = d->trad;
     if (activationReason == arInitial) {
         const int nLast = d->viIn->numFrames - 1;
-        for (int k = -trad; k <= trad; ++k) {
-            const int fn = std::clamp(n + k, 0, nLast);
-            if (k != 0 && fn == n)
-                continue; // clamped to the current frame: no temporal content
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+        for (const int fn : temporalFrameNumbers(n, nLast, trad))
             vsapi->requestFrameFilter(fn, d->node, frameCtx);
-        }
         return nullptr;
     }
     if (activationReason != arAllFramesReady)
@@ -389,17 +407,7 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
 
     // Per-frame H.273 siting (same rules as Recon; subsampled axes only)
     LGCRData dloc = *d;
-    {
-        int perr = 0;
-        const int64_t cl = vsapi->mapGetInt(vsapi->getFramePropertiesRO(src),
-                                            "_ChromaLocation", 0, &perr);
-        if (!perr) {
-            if (fmt->subSamplingW > 0)
-                dloc.shiftX = (cl == 0 || cl == 2 || cl == 4) ? -0.5 : 0.0;
-            if (fmt->subSamplingH > 0)
-                dloc.shiftY = (cl == 2 || cl == 3) ? -0.5 : (cl == 4 || cl == 5) ? 0.5 : 0.0;
-        }
-    }
+    applyFrameChromaSiting(dloc, fmt, src, vsapi);
     d = &dloc;
     const int sw = vsapi->getFrameWidth(src, 0);
     const int sh = vsapi->getFrameHeight(src, 0);
@@ -435,19 +443,14 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
     std::vector<std::vector<int16_t>> mvStoreX, mvStoreY;
     std::vector<std::vector<float>> confStore;
     // reserve: nbrs holds POINTERS into these vectors, reallocation would dangle
-    nbrs.reserve(2 * trad);
-    store.reserve(8 * trad);
-    mvStoreX.reserve(2 * trad);
-    mvStoreY.reserve(2 * trad);
-    confStore.reserve(2 * trad);
+    const std::vector<int> neighborFrames = temporalFrameNumbers(n, nLast, trad);
+    nbrs.reserve(neighborFrames.size());
+    store.reserve(4 * neighborFrames.size());
+    mvStoreX.reserve(neighborFrames.size());
+    mvStoreY.reserve(neighborFrames.size());
+    confStore.reserve(neighborFrames.size());
     if (d->strength > 0.0) {
-        for (int k = -trad; k <= trad; ++k) {
-            if (k == 0)
-                continue;
-            const int fn = std::clamp(n + k, 0, nLast);
-            if (fn == n)
-                continue; // boundary clamp: a duplicated current frame is not
-                          // temporal information (its "gain" was an artifact)
+        for (const int fn : neighborFrames) {
             const VSFrame *nf = vsapi->getFrameFilter(fn, d->node, frameCtx);
             auto ny = std::make_unique<Plane>(sw, sh);
             auto nu = std::make_unique<Plane>(cw, ch);
@@ -460,6 +463,9 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
             int bw = 0, bh = 0;
             blockMatch(y, *ny, 16, d->tsearch, float(d->tsad),
                        mvStoreX.back(), mvStoreY.back(), confStore.back(), bw, bh);
+            applyChromaConsistency(cb, cr, *nu, *nv, sw, sh, 16,
+                                   mvStoreX.back(), mvStoreY.back(), bw, bh,
+                                   confStore.back());
             auto lc = std::make_unique<Plane>(
                 buildLcMap(*ny, cw, ch, rw, rh, d->shiftX, d->shiftY));
             TemporalNbr nb;
@@ -681,7 +687,13 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
         d->kp2 = vsapi->mapGetFloatSaturated(in, "c", 0, &err); if (err) d->kp2 = 0.6;
     } else if (k == "lanczos") {
         d->kernel = Kernel::Lanczos;
-        d->kp1 = double(vsapi->mapGetIntSaturated(in, "taps", 0, &err)); if (err) d->kp1 = 3.0;
+        const int64_t taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        const int64_t checkedTaps = err ? 3 : taps;
+        if (checkedTaps < 1 || checkedTaps > 64) {
+            fail("LGCR: lanczos taps must be in the range 1..64");
+            return;
+        }
+        d->kp1 = double(checkedTaps);
         d->support = d->kp1;
     } else if (k == "spline16") {
         d->kernel = Kernel::Spline16;
@@ -692,7 +704,13 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
     } else if (k == "jinc") {
         d->kernel = Kernel::Jinc;
         d->radial = true;
-        d->kp1 = double(vsapi->mapGetIntSaturated(in, "taps", 0, &err)); if (err) d->kp1 = 3.0;
+        const int64_t taps = vsapi->mapGetIntSaturated(in, "taps", 0, &err);
+        const int64_t checkedTaps = err ? 3 : taps;
+        if (checkedTaps < 1 || checkedTaps > 64) {
+            fail("LGCR: jinc taps must be in the range 1..64");
+            return;
+        }
+        d->kp1 = double(checkedTaps);
         d->support = d->kp1;
         // Radial profile LUT, 1024 entries per unit distance
         const int n = static_cast<int>(d->support * 1024) + 2;
@@ -756,14 +774,15 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
     d->bp = vsapi->mapGetFloatSaturated(in, "bp", 0, &err); if (err) d->bp = 0.0;
     if (fmt->subSamplingW == 0)
         d->shiftX = 0.0;
+    if (fmt->subSamplingH == 0)
+        d->shiftY = 0.0;
 
     if (d->strength < 0.0 || d->strength > 1.0 || d->sigma <= 0.0 || d->sratio <= 0.0 ||
         d->sdb <= 0.0 || d->stretch < 0.0 || d->gsigma <= 0.0 || d->reg <= 0.0 ||
         d->bp < 0.0 || d->bp > 1.0 || d->ms < 0.0 || d->ms > 1.0 ||
-        d->qgate < 0.0 || d->qgate > 1.0 ||
-        ((d->kernel == Kernel::Lanczos || d->kernel == Kernel::Jinc) && d->kp1 < 1.0)) {
+        d->qgate < 0.0 || d->qgate > 1.0) {
         fail("LGCR: invalid parameter range (need 0<=strength<=1, 0<=bp/ms/qgate<=1, "
-             "sigma/sratio/sdb/gsigma/reg>0, stretch>=0, taps>=1)");
+             "sigma/sratio/sdb/gsigma/reg>0, stretch>=0)");
         return;
     }
 
