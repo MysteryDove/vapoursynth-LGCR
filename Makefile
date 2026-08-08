@@ -35,7 +35,7 @@ check: $(TARGET) liblgcr_scalar.so
 	$(PYTHON) test/battery.py --check
 
 asan-check: liblgcr_asan.so
-	LD_PRELOAD="$(shell $(CXX) -print-file-name=libasan.so)" ASAN_OPTIONS=detect_leaks=0 \
+	ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 \
 	LGCR_PLUGIN="$(CURDIR)/liblgcr_asan.so" $(PYTHON) test/test_regressions.py --asan
 
 clean:
