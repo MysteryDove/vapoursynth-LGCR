@@ -621,36 +621,28 @@ void reconstructChroma(const ChromaJob &job) {
 }
 
 
-// Plain (unguided) chroma reconstruction: separable fast path for separable
-// kernels, 2D radial path for jinc. Base for algo 3/4/5 and the strength=0
-// A/B reference.
+// Plain (unguided) chroma reconstruction. Deliberately NOT a separate fast
+// path: it runs the SAME reconstructChroma machinery with strength=0, so
+// that (a) strength=0 is bit-continuous with strength->0+ (a separate
+// resampleH/V path used different boundary semantics: renormalized truncated
+// kernels vs clamped taps, giving 0.05 jumps at borders between strength 0
+// and 1e-6), and (b) the jinc plain path honors vertical siting instead of
+// the historically hardcoded shiftY=0. Base for algo 3/4/5, the sparse fill,
+// and the strength=0 A/B reference.
 void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
                         const Plane &y, const GuideMaps &gm,
                         int sw, int sh, int cw, int ch,
                         Plane &cOutU, Plane &cOutV) {
     const double rw = double(sw) / cw, rh = double(sh) / ch;
-    if (!d->radial) {
-        // Chroma siting shift in chroma units = -shift/r
-        WeightTable th = buildWeights(cw, d->outW, d->kernel, d->kp1, d->kp2,
-                                      d->support, -d->shiftX / rw);
-        WeightTable tv = buildWeights(ch, d->outH, d->kernel, d->kp1, d->kp2,
-                                      d->support, -d->shiftY / rh);
-        Plane tmpU(d->outW, ch), tmpV(d->outW, ch);
-        resampleH(cb, tmpU, th);
-        resampleH(cr, tmpV, th);
-        resampleV(tmpU, cOutU, tv);
-        resampleV(tmpV, cOutV, tv);
-    } else {
-        LGCRData d0 = *d;
-        d0.strength = 0.0; // plain 2D radial pass
-        ChromaJob job;
-        job.srcU = &cb; job.srcV = &cr; job.srcY = &y; job.gm = &gm;
-        job.dstU = &cOutU; job.dstV = &cOutV;
-        job.srcLumaW = sw; job.srcLumaH = sh;
-        job.rw = rw; job.rh = rh; job.shiftX = d->shiftX; job.shiftY = 0.0;
-        job.d = &d0;
-        reconstructChroma(job);
-    }
+    LGCRData d0 = *d;
+    d0.strength = 0.0; // guided=false inside reconstructChroma
+    ChromaJob job;
+    job.srcU = &cb; job.srcV = &cr; job.srcY = &y; job.gm = &gm;
+    job.dstU = &cOutU; job.dstV = &cOutV;
+    job.srcLumaW = sw; job.srcLumaH = sh;
+    job.rw = rw; job.rh = rh; job.shiftX = d->shiftX; job.shiftY = d->shiftY;
+    job.d = &d0;
+    reconstructChroma(job);
 }
 
 // LGF coefficient planes for both chroma planes (algo 3/4)

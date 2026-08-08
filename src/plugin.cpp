@@ -122,14 +122,19 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
 
     // H.273 chroma siting from frame props, unless loc= was given explicitly.
     // 0=left 1=center 2=topleft 3=top 4=bottomleft 5=bottom
+    // Only applies on the subsampled axis: on 4:4:4 input the prop is
+    // meaningless and must not re-introduce a shift (it made 444->444
+    // non-identity even at strength=0).
     LGCRData dloc = *d;
     if (!dloc.locSet) {
         int perr = 0;
         const int64_t cl = vsapi->mapGetInt(vsapi->getFramePropertiesRO(src),
                                             "_ChromaLocation", 0, &perr);
         if (!perr) {
-            dloc.shiftX = (cl == 0 || cl == 2 || cl == 4) ? -0.5 : 0.0;
-            dloc.shiftY = (cl == 2 || cl == 3) ? -0.5 : (cl == 4 || cl == 5) ? 0.5 : 0.0;
+            if (fmt->subSamplingW > 0)
+                dloc.shiftX = (cl == 0 || cl == 2 || cl == 4) ? -0.5 : 0.0;
+            if (fmt->subSamplingH > 0)
+                dloc.shiftY = (cl == 2 || cl == 3) ? -0.5 : (cl == 4 || cl == 5) ? 0.5 : 0.0;
         }
     }
     d = &dloc;
@@ -200,7 +205,7 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     GuideMaps gm;
     if (d->strength > 0.0) {
         gm = buildGuideMaps(y, y, cw, ch, rw, rh, d->shiftX, d->shiftY, d->algo == 1);
-        if (d->ms > 0.0 && (d->algo == 2 || d->algo == 4))
+        if (d->ms > 0.0 && d->algo >= 2 && d->algo <= 4)
             gm.ms = buildMutualGate(gm.lc, cb, cr, d->sigma);
     }
 
@@ -240,10 +245,16 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
             job.selW3 = &w3;
             reconstructChroma(job);
             LGFMaps lgf = buildLGFMaps(d, y, cb, cr, cw, ch, rw, rh);
+            if (gm.ms.w > 0) // co-edge gate applies to the LGF branch too
+                for (int j = 0; j < ch; ++j)
+                    for (int i = 0; i < cw; ++i) {
+                        lgf.confU.at(i, j) *= gm.ms.at(i, j);
+                        lgf.confV.at(i, j) *= gm.ms.at(i, j);
+                    }
             const ChromaAxis ax = buildChromaAxis(sw, d->outW, rw, d->shiftX, d);
             const ChromaAxis ay = buildChromaAxis(sh, d->outH, rh, d->shiftY, d);
             blendSelector(cOutU, cOutV, gU, gV, lgf.aU, lgf.bU, lgf.aV, lgf.bV,
-                          lgf.confU, lgf.confV, yOut, ax, ay, w2, w3, cw, ch,
+                          lgf.confU, lgf.confV, y, ax, ay, w2, w3, cw, ch,
                           float(d->strength));
         }
     } else if (d->algo == 3) {
@@ -251,10 +262,16 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
         plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV);
         if (d->strength > 0.0) {
             LGFMaps lgf = buildLGFMaps(d, y, cb, cr, cw, ch, rw, rh);
+            if (gm.ms.w > 0) // co-edge gate applies here too
+                for (int j = 0; j < ch; ++j)
+                    for (int i = 0; i < cw; ++i) {
+                        lgf.confU.at(i, j) *= gm.ms.at(i, j);
+                        lgf.confV.at(i, j) *= gm.ms.at(i, j);
+                    }
             const ChromaAxis ax = buildChromaAxis(sw, d->outW, rw, d->shiftX, d);
             const ChromaAxis ay = buildChromaAxis(sh, d->outH, rh, d->shiftY, d);
             blendLGF(cOutU, cOutV, lgf.aU, lgf.bU, lgf.aV, lgf.bV,
-                     lgf.confU, lgf.confV, yOut, ax, ay, cw, ch, float(d->strength));
+                     lgf.confU, lgf.confV, y, ax, ay, cw, ch, float(d->strength));
         }
     } else if (d->strength == 0.0) {
         // Pure kernel A/B reference
@@ -346,6 +363,21 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
     const int nLast = d->viIn->numFrames - 1;
     const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
     const VSVideoFormat *fmt = vsapi->getVideoFrameFormat(src);
+
+    // Per-frame H.273 siting (same rules as Recon; subsampled axes only)
+    LGCRData dloc = *d;
+    {
+        int perr = 0;
+        const int64_t cl = vsapi->mapGetInt(vsapi->getFramePropertiesRO(src),
+                                            "_ChromaLocation", 0, &perr);
+        if (!perr) {
+            if (fmt->subSamplingW > 0)
+                dloc.shiftX = (cl == 0 || cl == 2 || cl == 4) ? -0.5 : 0.0;
+            if (fmt->subSamplingH > 0)
+                dloc.shiftY = (cl == 2 || cl == 3) ? -0.5 : (cl == 4 || cl == 5) ? 0.5 : 0.0;
+        }
+    }
+    d = &dloc;
     const int sw = vsapi->getFrameWidth(src, 0);
     const int sh = vsapi->getFrameHeight(src, 0);
     const int cw = vsapi->getFrameWidth(src, 1);
@@ -448,6 +480,14 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
     }
 
     Plane cOutU(sw, sh), cOutV(sw, sh);
+    // Sparse mode (off by default here): plain kernel everywhere, guided
+    // correction only near luma structure.
+    std::vector<uint8_t> mask;
+    if (d->sparse && d->strength > 0.0) {
+        const int dil = int(std::ceil(d->support * std::max(rw, rh))) + 8;
+        mask = buildTrustMask(gm, sw, sh, d->sigma, dil);
+        plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV);
+    }
     {
         ChromaJob job;
         job.srcU = &cb;
@@ -463,6 +503,13 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
         job.shiftX = d->shiftX;
         job.shiftY = d->shiftY;
         job.d = d;
+        if (!mask.empty()) {
+            job.mask = mask.data();
+            job.maskW = sw;
+            job.maskH = sh;
+            job.plainU = &cOutU;
+            job.plainV = &cOutV;
+        }
         if (!nbrs.empty())
             job.nbrs = &nbrs;
         reconstructChroma(job);
