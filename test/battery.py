@@ -118,6 +118,24 @@ def build_cases():
     Y, U, V = edge_planes(64, cshift=4)
     cases["misalign4"] = (Y, U, V, (np.abs(xx - 66) <= 5) & (yy > 4) & (yy < H - 4), 1.0)
 
+    # Half-chroma-px Y/C phase offset (edge at 65, luma at 64): the degraded
+    # chroma edge lands BETWEEN samples; snapping to the luma edge then
+    # misplaces the reconstruction by 1 luma px. Found by eval_gates.py:
+    # the worst single failure of the ungated snap (delta +0.026).
+    Y, U, V = edge_planes(64, cshift=1)
+    cases["misalign1"] = (Y, U, V, (np.abs(xx - 65) <= 4) & (yy > 4) & (yy < H - 4), 1.0)
+
+    # Null-space texture counterexample (external review): luma = step +
+    # alternating texture exactly in the null space of the 2x box/triangle/
+    # bicubic degradations; chroma = step only. Low-res affine statistics
+    # (q ~ 1) cannot see the texture; transferring a*(Y-Yb) would inject it.
+    t = np.clip(xx - 64 + 0.5, 0, 1)
+    alt = 0.10 * np.where((xx % 2) == 0, 1.0, -1.0)
+    Y = (0.30 + 0.05 * t + alt).astype(np.float32)
+    U = (-0.15 + 0.55 * t).astype(np.float32)
+    V = (0.40 - 0.60 * t).astype(np.float32)
+    cases["nullspace"] = (Y, U, V, band_v, 1.0)
+
     Y, U, V = edge_planes(64, soft=7)
     cases["hardL_softC"] = (Y, U, V, band_v, 1.0)
 
@@ -153,9 +171,11 @@ def build_cases():
 
 
 def run_temporal(algos):
-    """Edge moves 1 luma px between two frames; measure inter-frame chroma
-    difference in the static background region (should be ~zero for plain,
-    larger if guidance flickers)."""
+    """Aligned edge-band error variance: edge moves 1 luma px between two
+    frames; warp frame 1's per-pixel chroma error back by the known motion
+    and measure the variance of the aligned errors (flicker/phase-recovery
+    metric). The previous version measured inter-frame diff in the STATIC
+    region, which is trivially zero and says nothing (external review)."""
     yy, xx = grids()
     Ys, Us, Vs = [], [], []
     for k in range(2):
@@ -166,15 +186,19 @@ def run_temporal(algos):
         Vs.append((0.40 - 0.60 * tC).astype(np.float32))
     clip = make_clip(Ys, Us, Vs, length=2)
     src420 = degrade(clip)
-    static = (xx > 80) & (yy > 4) & (yy < H - 4)
+    band = (np.abs(xx - 64) <= 4) & (yy > 4) & (yy < H - 4)
+    band0 = band & (xx < W - 1)  # after the -1px back-warp
     out = {}
     for tag, kw in algos.items():
         node = core.lgcr.Recon(src420, kernel="jinc", taps=3, **kw)
         f0, f1 = node.get_frame(0), node.get_frame(1)
+        g0, g1 = clip.get_frame(0), clip.get_frame(1)
         d = 0.0
         for p in (1, 2):
-            d += np.abs(np.asarray(f1[p]).astype(np.float64) -
-                        np.asarray(f0[p]).astype(np.float64))[static].mean()
+            e0 = np.asarray(f0[p]).astype(np.float64) - np.asarray(g0[p]).astype(np.float64)
+            e1 = np.asarray(f1[p]).astype(np.float64) - np.asarray(g1[p]).astype(np.float64)
+            e1w = np.roll(e1, -1, axis=1)  # edge moved +1px: warp back
+            d += ((e0 - e1w) ** 2)[band0].mean() / 2
         out[tag] = d / 2
     return out
 
@@ -283,7 +307,7 @@ def main():
         lines.append(f"{name:<13}" + "".join(fmt(res[t]) for t in tags))
     res = run_temporal(algos)
     lines.append(f"{'temporal':<13}" + "".join(f"{res[t]:>10.5f}" for t in tags)
-                 + "   (inter-frame diff in static region; lower=better)")
+                 + "   (aligned edge-band error variance; lower=better)")
     tr = run_trecon_cases()
     lines.append("")
     lines.append("temporal cases (plain / algo2 / trecon):")
