@@ -59,8 +59,7 @@ void reconstructChroma(const ChromaJob &job) {
             const float *wxp = &ax.w[size_t(ox) * ax.sup];
             const float scx = ax.pos[ox];
 
-            const bool algo2 = d.algo >= 2;
-            float L0 = 0.0f, nxv = 0.0f, nyv = 0.0f, minDiffN = 0.0f, dbC = 0.0f;
+            float L0 = 0.0f, nxv = 0.0f, nyv = 0.0f, minDiffN = 0.0f;
             float coherence = 0.0f, ssRamp = 0.0f;
             bool hasDir = false;
             float ridgeRev = 0.0f; // sign-reversal depth along the gradient
@@ -95,16 +94,11 @@ void reconstructChroma(const ChromaJob &job) {
                 nyv = std::sin(theta);
                 hasDir = jsum > 1e-6f;
 
-                if (!algo2) {
-                    // v1.2: slope floor from the precomputed db map
-                    dbC = bilinearFast(gm.db, bxi, bxf, byi, byf);
-                }
-
                 // Step/ramp discriminator: min |diff| to the two luma
                 // samples one chroma spacing away along the gradient normal.
                 // On a step (any orientation) one of them is same-side (~0);
                 // on a ramp both equal the per-tap slope.
-                if (algo2 && hasDir) {
+                if (hasDir) {
                     const float lcx1 = ax.lpos[ox], lcy1 = ay.lpos[oy];
                     const float yA = bilinear(oY, lcx1 - spOut * nxv, lcy1 - spOut * nyv);
                     const float yB = bilinear(oY, lcx1 + spOut * nxv, lcy1 + spOut * nyv);
@@ -117,7 +111,7 @@ void reconstructChroma(const ChromaJob &job) {
                 // faded out on thin lines: there the true chroma is a soft
                 // blend, and "luma has an edge" does not imply "chroma has
                 // an edge".
-                if (algo2 && d.ridge && hasDir) {
+                if (d.ridge && hasDir) {
                     const float dl = 1.5f * spOut; // span +/-3 chroma-tap spacings
                     const float lcx2 = ax.lpos[ox], lcy2 = ay.lpos[oy];
                     const float ym2 = bilinear(oY, lcx2 - 2 * dl * nxv, lcy2 - 2 * dl * nyv);
@@ -206,24 +200,16 @@ void reconstructChroma(const ChromaJob &job) {
 
             // Adaptive similarity knee: snap whenever the window contains a
             // real luma step, stay conservative on flat/noisy luma.
-            float sigLoc;
-            if (algo2) {
-                // sigma multiplier: sratio on hard steps, sdb (much larger,
-                // kills discrimination) on ramps — smoothly blended
-                const float t2 = std::clamp(minDiffN / (0.1f * maxAbsDL + 1e-6f), 0.0f, 1.0f);
-                ssRamp = t2 * t2 * (3.0f - 2.0f * t2); // smoothstep; 0 = hard step, 1 = ramp
-                const float sigMult = float(d.sratio) + (float(d.sdb) - float(d.sratio)) * ssRamp;
-                sigLoc = std::max(float(d.sigma), sigMult * maxAbsDL);
-            } else {
-                // v1.2: three-way floor with the median-neighbor slope baseline
-                sigLoc = std::max(std::max(float(d.sigma), float(d.sratio) * maxAbsDL),
-                                  float(d.sdb) * dbC * float(std::max(job.rw, job.rh)));
-            }
+            // Sigma multiplier: sratio on hard steps, sdb (much larger,
+            // kills discrimination) on ramps, smoothly blended.
+            const float t2 = std::clamp(minDiffN / (0.1f * maxAbsDL + 1e-6f), 0.0f, 1.0f);
+            ssRamp = t2 * t2 * (3.0f - 2.0f * t2); // smoothstep; 0 = hard step, 1 = ramp
+            const float sigMult = float(d.sratio) + (float(d.sdb) - float(d.sratio)) * ssRamp;
+            const float sigLoc = std::max(float(d.sigma), sigMult * maxAbsDL);
             const float invSigma2 = 1.0f / (sigLoc * sigLoc);
             // Ridge fade: 1 = full guidance, 0 = plain kernel (thin line)
-            const float ridgeFade = algo2
-                ? 1.0f - std::clamp(2.0f * ridgeRev / (maxAbsDL + 1e-6f), 0.0f, 1.0f)
-                : 1.0f;
+            const float ridgeFade =
+                1.0f - std::clamp(2.0f * ridgeRev / (maxAbsDL + 1e-6f), 0.0f, 1.0f);
 
             // Chroma-edge-presence fade: estimate the source chroma
             // transition width along the edge normal, W_C = range / max
@@ -627,7 +613,7 @@ void reconstructChroma(const ChromaJob &job) {
 // resampleH/V path used different boundary semantics: renormalized truncated
 // kernels vs clamped taps, giving 0.05 jumps at borders between strength 0
 // and 1e-6), and (b) the jinc plain path honors vertical siting instead of
-// the historically hardcoded shiftY=0. Base for algo 3/4/5, the sparse fill,
+// the historically hardcoded shiftY=0. Base for algo 4/6, the sparse fill,
 // and the strength=0 A/B reference.
 void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
                         const Plane &y, const GuideMaps &gm,
@@ -645,7 +631,7 @@ void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
     reconstructChroma(job);
 }
 
-// LGF coefficient planes for both chroma planes (algo 3/4)
+// LGF coefficient planes for the internal algo=4 selector branch.
 
 
 LGFMaps buildLGFMaps(const LGCRData *d, const Plane &y, const Plane &cb,

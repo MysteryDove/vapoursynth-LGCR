@@ -146,20 +146,19 @@ def run_gate_regressions():
     assert max_diff <= 1e-5, f"AVX2/scalar algo6 mismatch: {max_diff}"
     print(f"AVX2-vs-scalar algo6 max diff: {max_diff:.2e}")
 
-    for algo in (3, 4):
-        errors = []
-        frames = []
-        for ms in (0.0, 0.5, 1.0):
-            frame = core.lgcr.Recon(src, kernel="jinc", taps=3, strength=0.8,
-                                    algo=algo, ms=ms).get_frame(0)
-            frames.append(frame)
-            errors.append(chroma_mae(frame, fgt, band))
-        assert max_chroma_diff(frames[0], frames[1]) > 1e-5
-        assert max_chroma_diff(frames[1], frames[2]) > 1e-5
-        assert errors[0] > errors[1] > errors[2], (
-            f"algo{algo} ms must be a continuous gate on the soft-edge case: {errors}")
-        print(f"algo{algo} ms interpolation: "
-              + " ".join(f"{value:.7f}" for value in errors))
+    errors = []
+    frames = []
+    for ms in (0.0, 0.5, 1.0):
+        frame = core.lgcr.Recon(src, kernel="jinc", taps=3, strength=0.8,
+                                algo=4, ms=ms).get_frame(0)
+        frames.append(frame)
+        errors.append(chroma_mae(frame, fgt, band))
+    assert max_chroma_diff(frames[0], frames[1]) > 1e-5
+    assert max_chroma_diff(frames[1], frames[2]) > 1e-5
+    assert errors[0] > errors[1] > errors[2], (
+        f"algo4 ms must be a continuous gate on the soft-edge case: {errors}")
+    print("algo4 ms interpolation: "
+          + " ".join(f"{value:.7f}" for value in errors))
 
 
 run_alias_regressions()

@@ -40,7 +40,7 @@ static const VSFrame *VS_CC sharpenGetFrame(int n, int activationReason, void *i
     if (cw != sw || ch != sh) {
         const double rw = double(sw) / cw, rh = double(sh) / ch;
         // shiftX=-0.5: MPEG-2 left siting when subsampled
-        GuideMaps gm = buildGuideMaps(y, y, cw, ch, rw, rh, -0.5, 0.0, false);
+        GuideMaps gm = buildGuideMaps(y, y, cw, ch, rw, rh, -0.5, 0.0);
         sharpenPlane(cb, &gm.lc, y, rw, rh, -0.5, 0.0, *d);
         sharpenPlane(cr, &gm.lc, y, rw, rh, -0.5, 0.0, *d);
     } else {
@@ -214,8 +214,8 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     // was tried and rejected); Lc footprint also from the source plane.
     GuideMaps gm;
     if (d->strength > 0.0) {
-        gm = buildGuideMaps(y, y, cw, ch, rw, rh, d->shiftX, d->shiftY, d->algo == 1);
-        if (d->ms > 0.0 && ((d->algo >= 2 && d->algo <= 4) || d->algo == 6))
+        gm = buildGuideMaps(y, y, cw, ch, rw, rh, d->shiftX, d->shiftY);
+        if (d->ms > 0.0)
             gm.ms = buildMutualGate(gm.lc, cb, cr, d->sigma);
     }
 
@@ -223,18 +223,7 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     // Both planes are processed in one pass — guide weights depend only on
     // luma and geometry, so U and V share them.
     Plane cOutU(d->outW, d->outH), cOutV(d->outW, d->outH);
-    if (d->algo == 5) {
-        // NEDI-lite: plain base, then covariance-adaptive correction.
-        // Same-size only (the 4-tap covariance scheme is defined for 2x).
-        plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV);
-        if (d->strength > 0.0) {
-            const ChromaAxis ax = buildChromaAxis(sw, d->outW, rw, d->shiftX, d);
-            const ChromaAxis ay = buildChromaAxis(sh, d->outH, rh, d->shiftY, d);
-            const Plane plainU = cOutU, plainV = cOutV;
-            nediChroma(cb, cr, cOutU, cOutV, ax, ay, plainU, plainV,
-                       float(d->strength), d->reg * d->reg, d->arMargin);
-        }
-    } else if (d->algo == 4) {
+    if (d->algo == 4) {
         // Selector: plain base + per-pixel routing between the sim path
         // (axis-aligned hard edges) and the LGF path (diagonal hard edges)
         plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV);
@@ -250,7 +239,6 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
             job.srcLumaW = sw; job.srcLumaH = sh;
             job.rw = rw; job.rh = rh; job.shiftX = d->shiftX; job.shiftY = d->shiftY;
             job.d = &d4;
-            job.outY = &yOut;
             job.selW2 = &w2;
             job.selW3 = &w3;
             reconstructChroma(job);
@@ -267,23 +255,6 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
             blendSelector(cOutU, cOutV, gU, gV, lgf.aU, lgf.bU, lgf.aV, lgf.bV,
                           lgf.confU, lgf.confV, y, ax, ay, w2, w3, cw, ch,
                           float(d->strength));
-        }
-    } else if (d->algo == 3) {
-        // LGF: plain kernel base, then blend with the local linear model
-        plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV);
-        if (d->strength > 0.0) {
-            LGFMaps lgf = buildLGFMaps(d, y, cb, cr, cw, ch, rw, rh);
-            if (gm.ms.w > 0) // co-edge gate applies here too
-                for (int j = 0; j < ch; ++j)
-                    for (int i = 0; i < cw; ++i) {
-                        const float f = 1.0f - float(d->ms) * (1.0f - gm.ms.at(i, j));
-                        lgf.confU.at(i, j) *= f;
-                        lgf.confV.at(i, j) *= f;
-                    }
-            const ChromaAxis ax = buildChromaAxis(sw, d->outW, rw, d->shiftX, d);
-            const ChromaAxis ay = buildChromaAxis(sh, d->outH, rh, d->shiftY, d);
-            blendLGF(cOutU, cOutV, lgf.aU, lgf.bU, lgf.aV, lgf.bV,
-                     lgf.confU, lgf.confV, y, ax, ay, cw, ch, float(d->strength));
         }
     } else if (d->algo == 6) {
         // Constrained detail transfer: plain kernel base + g*a*(Y - P(D(Y))).
@@ -310,7 +281,7 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
         // Pure kernel A/B reference
         plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV);
     } else {
-        // algo 1/2 guided path. Sparse mode: plain kernel everywhere, guided
+        // algo=2 guided path. Sparse mode: plain kernel everywhere, guided
         // correction only where luma structure makes it worthwhile.
         std::vector<uint8_t> mask;
         if (d->sparse) {
@@ -322,7 +293,6 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
         job.srcU = &cb;
         job.srcV = &cr;
         job.srcY = &y;
-        job.outY = &yOut;
         job.gm = &gm;
         job.dstU = &cOutU;
         job.dstV = &cOutV;
@@ -492,7 +462,7 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
     // Y: same size -> verbatim copy
     GuideMaps gm;
     if (d->strength > 0.0) {
-        gm = buildGuideMaps(y, y, cw, ch, rw, rh, d->shiftX, d->shiftY, false);
+        gm = buildGuideMaps(y, y, cw, ch, rw, rh, d->shiftX, d->shiftY);
         if (d->ms > 0.0)
             gm.ms = buildMutualGate(gm.lc, cb, cr, d->sigma);
     }
@@ -731,16 +701,12 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
         const int64_t a = vsapi->mapGetIntSaturated(in, "algo", 0, &err);
         d->algo = err ? 2 : int(a);
     }
-    if (d->algo < 1 || d->algo > 6) {
-        fail("LGCR: algo must be 1 (v1.2), 2 (v1.3), 3 (LGF), 4 (selector), 5 (NEDI) or 6 (detail transfer)");
-        return;
-    }
-    if (d->algo == 5 && (d->outW != d->viIn->width || d->outH != d->viIn->height)) {
-        fail("LGCR: algo=5 (NEDI) requires same-size output (no scaling)");
+    if (d->algo != 2 && d->algo != 4 && d->algo != 6) {
+        fail("LGCR: algo must be 2 (guided), 4 (selector) or 6 (detail transfer)");
         return;
     }
     d->sdb = vsapi->mapGetFloatSaturated(in, "sdb", 0, &err);
-    if (err) d->sdb = (d->algo == 1) ? 1.5 : 3.0;
+    if (err) d->sdb = 3.0;
     d->stretch = vsapi->mapGetFloatSaturated(in, "stretch", 0, &err); if (err) d->stretch = 1.0;
     d->gsigma = vsapi->mapGetFloatSaturated(in, "gsigma", 0, &err); if (err) d->gsigma = 2.5;
     {
