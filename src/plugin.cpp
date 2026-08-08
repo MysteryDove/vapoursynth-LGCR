@@ -248,8 +248,9 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
             if (gm.ms.w > 0) // co-edge gate applies to the LGF branch too
                 for (int j = 0; j < ch; ++j)
                     for (int i = 0; i < cw; ++i) {
-                        lgf.confU.at(i, j) *= gm.ms.at(i, j);
-                        lgf.confV.at(i, j) *= gm.ms.at(i, j);
+                        const float f = 1.0f - float(d->ms) * (1.0f - gm.ms.at(i, j));
+                        lgf.confU.at(i, j) *= f;
+                        lgf.confV.at(i, j) *= f;
                     }
             const ChromaAxis ax = buildChromaAxis(sw, d->outW, rw, d->shiftX, d);
             const ChromaAxis ay = buildChromaAxis(sh, d->outH, rh, d->shiftY, d);
@@ -265,8 +266,9 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
             if (gm.ms.w > 0) // co-edge gate applies here too
                 for (int j = 0; j < ch; ++j)
                     for (int i = 0; i < cw; ++i) {
-                        lgf.confU.at(i, j) *= gm.ms.at(i, j);
-                        lgf.confV.at(i, j) *= gm.ms.at(i, j);
+                        const float f = 1.0f - float(d->ms) * (1.0f - gm.ms.at(i, j));
+                        lgf.confU.at(i, j) *= f;
+                        lgf.confV.at(i, j) *= f;
                     }
             const ChromaAxis ax = buildChromaAxis(sw, d->outW, rw, d->shiftX, d);
             const ChromaAxis ay = buildChromaAxis(sh, d->outH, rh, d->shiftY, d);
@@ -292,7 +294,7 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
                 mw = sw;
                 mh = sh;
             }
-            detailTransfer(d, cOutU, cOutV, yOut, af, gm, ax, ay, mp, mw, mh);
+            detailTransfer(d, cOutU, cOutV, af, gm, ax, ay, mp, mw, mh);
         }
     } else if (d->strength == 0.0) {
         // Pure kernel A/B reference
@@ -730,6 +732,7 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
         d->cedge = err ? false : (ce != 0);
     }
     d->ms = vsapi->mapGetFloatSaturated(in, "ms", 0, &err); if (err) d->ms = 1.0;
+    d->qgate = vsapi->mapGetFloatSaturated(in, "qgate", 0, &err); if (err) d->qgate = 1.0;
     d->arMargin = vsapi->mapGetFloatSaturated(in, "ar", 0, &err); if (err) d->arMargin = 0.0;
     d->reg = vsapi->mapGetFloatSaturated(in, "reg", 0, &err); if (err) d->reg = 0.005;
 
@@ -757,8 +760,9 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
     if (d->strength < 0.0 || d->strength > 1.0 || d->sigma <= 0.0 || d->sratio <= 0.0 ||
         d->sdb <= 0.0 || d->stretch < 0.0 || d->gsigma <= 0.0 || d->reg <= 0.0 ||
         d->bp < 0.0 || d->bp > 1.0 || d->ms < 0.0 || d->ms > 1.0 ||
+        d->qgate < 0.0 || d->qgate > 1.0 ||
         ((d->kernel == Kernel::Lanczos || d->kernel == Kernel::Jinc) && d->kp1 < 1.0)) {
-        fail("LGCR: invalid parameter range (need 0<=strength<=1, 0<=bp<=1, 0<=ms<=1, "
+        fail("LGCR: invalid parameter range (need 0<=strength<=1, 0<=bp/ms/qgate<=1, "
              "sigma/sratio/sdb/gsigma/reg>0, stretch>=0, taps>=1)");
         return;
     }
@@ -788,7 +792,7 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
         "Recon",
         "clip:vnode;width:int:opt;height:int:opt;kernel:data:opt;taps:int:opt;algo:int:opt;"
         "b:float:opt;c:float:opt;strength:float:opt;sigma:float:opt;sratio:float:opt;"
-        "sdb:float:opt;stretch:float:opt;gsigma:float:opt;ridge:int:opt;cedge:int:opt;ar:float:opt;reg:float:opt;loc:data:opt;sparse:int:opt;bp:float:opt;ms:float:opt",
+        "sdb:float:opt;stretch:float:opt;gsigma:float:opt;ridge:int:opt;cedge:int:opt;ar:float:opt;reg:float:opt;loc:data:opt;sparse:int:opt;bp:float:opt;ms:float:opt;qgate:float:opt",
         "clip:vnode", lgcrCreate, nullptr, plugin);
     vspapi->registerFunction(
         "Sharpen",

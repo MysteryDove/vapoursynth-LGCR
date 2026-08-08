@@ -121,13 +121,14 @@ struct LGCRData {
     double sigma = 0.01;             // luminance similarity sigma floor (normalized)
     double sratio = 0.15;            // adaptive sigma = max(sigma, sratio * window luma range)
     double sdb = 3.0;                // sigma multiplier (x window range) on ramps vs steps
-    double reg = 0.005;              // algo=3/5: LGF/NEDI regularization (normalized units)
+    double reg = 0.005;              // algo=3/5/6 regression regularization (normalized units)
     double stretch = 1.0;            // along-edge support stretch (0 = isotropic)
     double gsigma = 2.5;             // guided-bump width sigma (luma px)
-    int algo = 2;                    // 1 = v1.2, 2 = v1.3, 3 = LGF, 4 = selector, 5 = NEDI
+    int algo = 2;                    // 1=v1.2, 2=v1.3, 3=LGF, 4=selector, 5=NEDI, 6=detail
     bool ridge = true;               // thin-line (ridge) detection (algo 2/4)
     bool cedge = false;              // EXPERIMENTAL: wide-chroma-transition fade (off, see README)
-    double ms = 1.0;                 // mutual-structure co-edge gate strength (algo 2/4, TRecon)
+    double ms = 1.0;                 // mutual-structure gate strength (algo 2/3/4/6, TRecon)
+    double qgate = 1.0;              // algo=6 affine-credibility gate strength [0,1]
     bool sparse = true;              // sparse correction: guide only near luma structure
     bool locSet = false;             // loc param explicitly given (else read _ChromaLocation)
     double bp = 0.0;                 // back-projection data-consistency gain (420 same-size)
@@ -376,21 +377,21 @@ void backProject(Plane &cOut, const Plane &cSrc, float bp);
 // algo=6: constrained detail transfer (maps + application)
 //
 //   C0 = P(C420)            plain kernel base (low freq / color reference)
-//   Yc = D^(Y), Yb = P(Yc)  matched-degradation luma and its plain upsample
-//   C1 = C0 + g * a * lp_tangent(Y - Yb)
+//   Yc = consensus_k D_k(Y), Yb = P(Yc)
+//   C1 = C0 + g * a * R(lp_source(Y - Yb))
 //
-// a is the chroma-grid regression slope, q-weight-averaged over candidate
-// degradation kernels {box, triangle, bicubic}; g composites the joint-U/V
+// a is the median chroma-grid regression slope over candidate degradation
+// kernels {box, triangle, bicubic}; g composites the joint-U/V
 // affine credibility q, multi-kernel stability, chroma significance, and
 // (at application time) the mutual-structure gate and strength. The detail
-// field is binomially low-passed before transfer: the (-1)^x luma Nyquist
-// mode sits in the null space of EVERY symmetric 2x decimation kernel, so
-// no low-res statistic can ever confirm it — projecting it out is the only
-// defense (the review's null-space counterexample).
+// field is binomially low-passed on the SOURCE luma grid along each subsampled
+// axis before output scaling. Each dyadic stage uses its own stride, rejecting
+// that stage's axis-alias frequency; this is deliberately not claimed to span
+// the full null space of an unknown encoder.
 struct AffineMaps {
     Plane aU, aV;      // regression slope per chroma sample (chroma res)
     Plane g;           // composite confidence before ms/strength (chroma res)
-    Plane yb;          // P(Yc): plain-upsampled matched luma (output res)
+    Plane detail;      // constrained luma detail, resampled to output space
     Plane mnU, mxU, mnV, mxV; // 5x5 window hull per plane (chroma res)
     Plane rng;         // max(U,V) window range, for the magnitude cap
     AffineMaps() = default;
@@ -400,7 +401,7 @@ AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
                            const Plane &cr, int cw, int ch, double rw, double rh);
 
 void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
-                    const Plane &yOut, const AffineMaps &af, const GuideMaps &gm,
+                    const AffineMaps &af, const GuideMaps &gm,
                     const ChromaAxis &ax, const ChromaAxis &ay,
                     const uint8_t *mask, int maskW, int maskH);
 

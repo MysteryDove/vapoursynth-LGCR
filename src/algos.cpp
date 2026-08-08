@@ -382,6 +382,59 @@ void blockMatch(const Plane &cur, const Plane &nbr, int blockSize, int search,
 // algo=6: constrained detail transfer
 // ---------------------------------------------------------------------------
 
+static float median3(float a, float b, float c) {
+    return a + b + c - std::min({a, b, c}) - std::max({a, b, c});
+}
+
+static Plane suppressSourceNyquist(const Plane &src, double rw, double rh) {
+    Plane cur = src;
+    auto levelsFor = [](double ratio) {
+        int levels = 0;
+        while (ratio > 1.5 && levels < 4) {
+            ratio *= 0.5;
+            ++levels;
+        }
+        return levels;
+    };
+    for (int pass = 0; pass < levelsFor(rw); ++pass) {
+        const int step = 1 << pass;
+        Plane next(cur.w, cur.h);
+        for (int y = 0; y < cur.h; ++y)
+            for (int x = 0; x < cur.w; ++x)
+                next.at(x, y) = 0.25f * cur.at(x - step, y) + 0.5f * cur.at(x, y)
+                              + 0.25f * cur.at(x + step, y);
+        cur = std::move(next);
+    }
+    for (int pass = 0; pass < levelsFor(rh); ++pass) {
+        const int step = 1 << pass;
+        Plane next(cur.w, cur.h);
+        for (int y = 0; y < cur.h; ++y)
+            for (int x = 0; x < cur.w; ++x)
+                next.at(x, y) = 0.25f * cur.at(x, y - step) + 0.5f * cur.at(x, y)
+                              + 0.25f * cur.at(x, y + step);
+        cur = std::move(next);
+    }
+    return cur;
+}
+
+static Plane resampleDetailToOutput(const Plane &src, const LGCRData &d) {
+    if (src.w == d.outW && src.h == d.outH)
+        return src;
+    Plane out(d.outW, d.outH);
+    if (d.radial) {
+        resampleRadial(src, out, d);
+    } else {
+        const WeightTable th = buildWeights(src.w, d.outW, d.kernel, d.kp1, d.kp2,
+                                            d.support, 0.0);
+        const WeightTable tv = buildWeights(src.h, d.outH, d.kernel, d.kp1, d.kp2,
+                                            d.support, 0.0);
+        Plane tmp(d.outW, src.h);
+        resampleH(src, tmp, th);
+        resampleV(tmp, out, tv);
+    }
+    return out;
+}
+
 AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
                            const Plane &cr, int cw, int ch, double rw, double rh) {
     AffineMaps m;
@@ -446,51 +499,57 @@ AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
             const double qsum = qk[0] + qk[1] + qk[2];
             const double qmax = std::max({qk[0], qk[1], qk[2]});
             const double qmin = std::min({qk[0], qk[1], qk[2]});
-            if (qsum > 1e-9) {
-                m.aU.at(cx, cy) = float((qk[0] * aUk[0] + qk[1] * aUk[1] + qk[2] * aUk[2]) / qsum);
-                m.aV.at(cx, cy) = float((qk[0] * aVk[0] + qk[1] * aVk[1] + qk[2] * aVk[2]) / qsum);
-            }
+            // Keep the correction estimator independent of q so q can be
+            // evaluated as a gate without generating its own labels.
+            m.aU.at(cx, cy) = median3(float(aUk[0]), float(aUk[1]), float(aUk[2]));
+            m.aV.at(cx, cy) = median3(float(aVk[0]), float(aVk[1]), float(aVk[2]));
             const double qMean = qsum / 3.0;
             const double stab = qmax > 1e-9 ? qmin / qmax : 0.0; // multi-kernel agreement
             const double sigC = (varU + varV) / (varU + varV + epsSig);
             m.g.at(cx, cy) = float(qMean * stab * sigC);
         }
     }
-    // Yb = P(Yc): the matched luma put through the SAME plain kernel path as
-    // the chroma base, so (Y - Yb) is exactly the detail the plain path lost.
+    // Build a kernel-independent matched guide by taking the per-sample median
+    // of the candidate degradations. q/stability decide whether to trust the
+    // resulting correction, but do not choose its direction or base signal.
+    Plane ycConsensus(cw, ch);
+    for (int cy = 0; cy < ch; ++cy)
+        for (int cx = 0; cx < cw; ++cx)
+            ycConsensus.at(cx, cy) = median3(yc[0].at(cx, cy), yc[1].at(cx, cy),
+                                              yc[2].at(cx, cy));
+
+    // Reconstruct matched luma to the SOURCE luma grid first. The unobservable
+    // frequency locations are defined on this grid and must not move when the
+    // user requests a different output size.
     GuideMaps gmEmpty; // plain path never reads guide maps
-    m.yb = Plane(d->outW, d->outH);
-    Plane dummy(d->outW, d->outH);
-    plainChroma(d, yc[0], yc[0], y, gmEmpty, y.w, y.h, cw, ch, m.yb, dummy);
+    LGCRData sourceD = *d;
+    sourceD.outW = y.w;
+    sourceD.outH = y.h;
+    Plane ybSource(y.w, y.h), dummy(y.w, y.h);
+    plainChroma(&sourceD, ycConsensus, ycConsensus, y, gmEmpty,
+                y.w, y.h, cw, ch, ybSource, dummy);
+    Plane sourceDetail(y.w, y.h);
+    for (int py = 0; py < y.h; ++py)
+        for (int px = 0; px < y.w; ++px)
+            sourceDetail.at(px, py) = y.at(px, py) - ybSource.at(px, py);
+    sourceDetail = suppressSourceNyquist(sourceDetail, rw, rh);
+    m.detail = resampleDetailToOutput(sourceDetail, *d);
     return m;
 }
 
 void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
-                    const Plane &yOut, const AffineMaps &af, const GuideMaps &gm,
+                    const AffineMaps &af, const GuideMaps &gm,
                     const ChromaAxis &ax, const ChromaAxis &ay,
                     const uint8_t *mask, int maskW, int maskH) {
     const int ow = outU.w, oh = outU.h;
-    // Detail field, then null-space projection: separable binomial [1,2,1]
-    // kills the luma Nyquist mode that no symmetric 2x decimation kernel can
-    // observe at chroma rate (the unprovable component must not transfer).
-    Plane dl(ow, oh);
-    {
-        Plane df(ow, oh);
-        for (int j = 0; j < oh; ++j)
-            for (int i = 0; i < ow; ++i)
-                df.at(i, j) = yOut.at(i, j) - af.yb.at(i, j);
-        for (int j = 0; j < oh; ++j)
-            for (int i = 0; i < ow; ++i)
-                dl.at(i, j) = 0.25f * df.at(i - 1, j) + 0.5f * df.at(i, j) + 0.25f * df.at(i + 1, j);
-        for (int j = 0; j < oh; ++j)
-            for (int i = 0; i < ow; ++i)
-                dl.at(i, j) = 0.25f * dl.at(i, j - 1) + 0.5f * dl.at(i, j) + 0.25f * dl.at(i, j + 1);
-    }
+    const Plane &dl = af.detail;
     const BilinAxis bcx = buildBilinAxis(ax.pos, af.g.w);
     const BilinAxis bcy = buildBilinAxis(ay.pos, af.g.h);
     const BilinAxis blx = buildBilinAxis(ax.lpos, gm.jxx.w);
     const BilinAxis bly = buildBilinAxis(ay.lpos, gm.jxx.h);
     const bool useMs = d->ms > 0.0 && gm.ms.w > 0;
+    const float msStrength = float(d->ms);
+    const float qStrength = float(d->qgate);
     const float strength = float(d->strength);
     const float ar = float(std::max(0.0, d->arMargin));
     const bool clampHull = d->arMargin >= 0.0;
@@ -506,9 +565,12 @@ void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
                 continue;
             const int cxi = bcx.i0[ox];
             const float cxf = bcx.f[ox];
-            float g = bilinearFast(af.g, cxi, cxf, cyi, cyf) * strength;
-            if (useMs)
-                g *= bilinearFast(gm.ms, cxi, cxf, cyi, cyf);
+            const float q = bilinearFast(af.g, cxi, cxf, cyi, cyf);
+            float g = (1.0f - qStrength * (1.0f - q)) * strength;
+            if (useMs) {
+                const float ms = bilinearFast(gm.ms, cxi, cxf, cyi, cyf);
+                g *= 1.0f - msStrength * (1.0f - ms);
+            }
             if (g < 1e-3f)
                 continue;
             const float au = bilinearFast(af.aU, cxi, cxf, cyi, cyf);
@@ -522,8 +584,8 @@ void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
             const float theta = 0.5f * std::atan2(2.0f * jxy, jdiff);
             // tangent = (-sin, cos)... normal n=(cos,sin); tangent t=(-ny,nx)
             const float tx = -std::sin(theta), ty = std::cos(theta);
-            // 1D restriction: smooth the detail along the edge tangent so
-            // tangential luma texture is never injected into chroma
+            // 1D restriction: attenuate detail along the edge tangent before
+            // it can be injected into chroma.
             const float dc = dl.at(ox, oy);
             const float s = 1.0f + float(d->stretch) * coherence;
             const float dtp = bilinear(dl, ox + tx * s, oy + ty * s);

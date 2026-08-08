@@ -15,11 +15,13 @@ Cases:
   texture            - chroma texture, flat luma
   noise              - hard edge + sensor-ish noise (robustness)
   upscale2x          - same hard edge, but 420 -> 2x upscale (scaler mode)
-  temporal           - two frames, edge moves 1 luma px: output flicker metric
+  nullspace_x/y/xy   - targeted axis/checker Nyquist aliases in luma only
+  temporal           - two frames, edge moves 1 luma px: aligned error variance
 
-Usage: python3 test/battery.py [--all]   (--all runs algo 1..5, default plain+algo2)
+Usage: python3 test/battery.py [--all]   (--all runs algo 1..6, default plain+algo2)
 """
 import math
+import os
 import sys
 
 import numpy as np
@@ -27,7 +29,9 @@ import vapoursynth as vs
 
 core = vs.core
 core.num_threads = 8
-core.std.LoadPlugin("/home/owen/dev/bsflab/liblgcr.so")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+core.std.LoadPlugin(os.path.join(ROOT, "liblgcr.so"))
 
 W, H = 128, 128
 F444 = core.query_video_format(vs.YUV, vs.FLOAT, 32, 0, 0)
@@ -125,16 +129,19 @@ def build_cases():
     Y, U, V = edge_planes(64, cshift=1)
     cases["misalign1"] = (Y, U, V, (np.abs(xx - 65) <= 4) & (yy > 4) & (yy < H - 4), 1.0)
 
-    # Null-space texture counterexample (external review): luma = step +
-    # alternating texture exactly in the null space of the 2x box/triangle/
-    # bicubic degradations; chroma = step only. Low-res affine statistics
-    # (q ~ 1) cannot see the texture; transferring a*(Y-Yb) would inject it.
+    # Targeted Nyquist counterexamples: luma = step + axis/checker alternating
+    # texture, chroma = step only. These are not a claim to span an unknown
+    # encoder's entire null space.
     t = np.clip(xx - 64 + 0.5, 0, 1)
-    alt = 0.10 * np.where((xx % 2) == 0, 1.0, -1.0)
-    Y = (0.30 + 0.05 * t + alt).astype(np.float32)
-    U = (-0.15 + 0.55 * t).astype(np.float32)
-    V = (0.40 - 0.60 * t).astype(np.float32)
-    cases["nullspace"] = (Y, U, V, band_v, 1.0)
+    for label, alt in (
+        ("nullspace_x", 0.10 * np.where((xx % 2) == 0, 1.0, -1.0)),
+        ("nullspace_y", 0.10 * np.where((yy % 2) == 0, 1.0, -1.0)),
+        ("nullspace_xy", 0.10 * np.where(((xx + yy) % 2) == 0, 1.0, -1.0)),
+    ):
+        Y = (0.30 + 0.05 * t + alt).astype(np.float32)
+        U = (-0.15 + 0.55 * t).astype(np.float32)
+        V = (0.40 - 0.60 * t).astype(np.float32)
+        cases[label] = (Y, U, V, band_v, 1.0)
 
     Y, U, V = edge_planes(64, soft=7)
     cases["hardL_softC"] = (Y, U, V, band_v, 1.0)
@@ -193,13 +200,14 @@ def run_temporal(algos):
         node = core.lgcr.Recon(src420, kernel="jinc", taps=3, **kw)
         f0, f1 = node.get_frame(0), node.get_frame(1)
         g0, g1 = clip.get_frame(0), clip.get_frame(1)
-        d = 0.0
+        plane_vars = []
         for p in (1, 2):
             e0 = np.asarray(f0[p]).astype(np.float64) - np.asarray(g0[p]).astype(np.float64)
             e1 = np.asarray(f1[p]).astype(np.float64) - np.asarray(g1[p]).astype(np.float64)
             e1w = np.roll(e1, -1, axis=1)  # edge moved +1px: warp back
-            d += ((e0 - e1w) ** 2)[band0].mean() / 2
-        out[tag] = d / 2
+            temporal_var = np.var(np.stack((e0, e1w)), axis=0)
+            plane_vars.append(temporal_var[band0].mean())
+        out[tag] = float(np.mean(plane_vars))
     return out
 
 
@@ -325,9 +333,9 @@ def main():
     lines.append(f"int8 constant (64,128,128): {res8}  {'OK' if ok8 else 'FAIL'}")
     report = "\n".join(lines)
     print(report)
-    import os
-    os.makedirs("test/results", exist_ok=True)
-    with open("test/results/latest.md", "w") as f:
+    results_dir = os.path.join(HERE, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    with open(os.path.join(results_dir, "latest.md"), "w") as f:
         f.write("# LGCR battery results\n\n```\n" + report + "\n```\n")
 
 
