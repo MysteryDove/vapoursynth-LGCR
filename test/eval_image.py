@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate every Recon algorithm on a real image with a self-consistent 420 round trip."""
+"""Evaluate retained Recon algorithms on a self-consistent real-image 420 round trip."""
 import argparse
 import hashlib
 import os
@@ -59,7 +59,7 @@ def evaluate(input_path):
     masks = {"full": np.ones_like(edge), "edge": edge, "smooth": smooth}
     configs = {"plain": dict(strength=0.0)}
     configs.update({f"algo{algo}": dict(strength=0.8, algo=algo)
-                    for algo in range(1, 7)})
+                    for algo in (2, 4, 6)})
 
     rows = {}
     for tag, kwargs in configs.items():

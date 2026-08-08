@@ -2,7 +2,7 @@
 
 namespace lgcr {
 
-// LGF / selector / NEDI / sharpen
+// LGF-backed selector / sharpen / temporal support / detail transfer
 
 void buildLGF(const Plane &Y, int cw, int ch, double rw, double rh,
                      double shiftX, double shiftY, const Plane &C, int radius, double eps,
@@ -59,37 +59,6 @@ void buildLGF(const Plane &Y, int cw, int ch, double rw, double rh,
     }
 }
 
-// out = (1-lam)*plain + lam*(a*Y0 + b), evaluated at full-res positions
-void blendLGF(Plane &outU, Plane &outV,
-                     const Plane &aU, const Plane &bU, const Plane &aV, const Plane &bV,
-                     const Plane &confU, const Plane &confV, const Plane &Y,
-                     const ChromaAxis &ax, const ChromaAxis &ay,
-                     int cw, int ch, float lam) {
-    const BilinAxis bcx = buildBilinAxis(ax.pos, cw);
-    const BilinAxis bcy = buildBilinAxis(ay.pos, ch);
-    const BilinAxis blx = buildBilinAxis(ax.lpos, Y.w);
-    const BilinAxis bly = buildBilinAxis(ay.lpos, Y.h);
-    for (int oy = 0; oy < outU.h; ++oy) {
-        float *ru = outU.row(oy);
-        float *rv = outV.row(oy);
-        const int cyi = bcy.i0[oy], lyi = bly.i0[oy];
-        const float cyf = bcy.f[oy], lyf = bly.f[oy];
-        for (int ox = 0; ox < outU.w; ++ox) {
-            const float L0 = bilinearFast(Y, blx.i0[ox], blx.f[ox], lyi, lyf);
-            const int cxi = bcx.i0[ox];
-            const float cxf = bcx.f[ox];
-            const float au = bilinearFast(aU, cxi, cxf, cyi, cyf);
-            const float bu = bilinearFast(bU, cxi, cxf, cyi, cyf);
-            const float av = bilinearFast(aV, cxi, cxf, cyi, cyf);
-            const float bv = bilinearFast(bV, cxi, cxf, cyi, cyf);
-            const float lu = lam * bilinearFast(confU, cxi, cxf, cyi, cyf);
-            const float lv = lam * bilinearFast(confV, cxi, cxf, cyi, cyf);
-            ru[ox] = (1.0f - lu) * ru[ox] + lu * (au * L0 + bu);
-            rv[ox] = (1.0f - lv) * rv[ox] + lv * (av * L0 + bv);
-        }
-    }
-}
-
 // algo=4: per-pixel mechanism selector.
 //   out = plain + lam * (w2 * (guided - plain) + w3 * conf * (lgf - plain))
 // w2/w3 come from the guided pass (hard-edge-ness x axis/diagonal split).
@@ -132,89 +101,6 @@ void blendSelector(Plane &outU, Plane &outV,
         }
     }
 }
-
-
-static void solve4x4(float R[4][4], float r[4], float a[4]) {
-    // Gaussian elimination with partial pivoting
-    for (int col = 0; col < 4; ++col) {
-        int piv = col;
-        for (int row = col + 1; row < 4; ++row)
-            if (std::fabs(R[row][col]) > std::fabs(R[piv][col]))
-                piv = row;
-        if (piv != col) {
-            for (int k = col; k < 4; ++k) std::swap(R[piv][k], R[col][k]);
-            std::swap(r[piv], r[col]);
-        }
-        const float d = R[col][col];
-        if (std::fabs(d) < 1e-12f)
-            continue;
-        for (int row = col + 1; row < 4; ++row) {
-            const float f = R[row][col] / d;
-            for (int k = col; k < 4; ++k) R[row][k] -= f * R[col][k];
-            r[row] -= f * r[col];
-        }
-    }
-    for (int row = 3; row >= 0; --row) {
-        float s = r[row];
-        for (int k = row + 1; k < 4; ++k) s -= R[row][k] * a[k];
-        a[row] = (std::fabs(R[row][row]) > 1e-12f) ? s / R[row][row] : 0.25f;
-    }
-}
-
-static float nediPixel(const Plane &C, float scx, float scy, double eps, double arMargin) {
-    const int i0 = static_cast<int>(std::floor(scx - 0.5f));
-    const int j0 = static_cast<int>(std::floor(scy - 0.5f));
-    // covariance over a 6x6 window of source samples
-    float R[4][4] = {}, r[4] = {};
-    for (int j = j0 - 2; j <= j0 + 3; ++j)
-        for (int i = i0 - 2; i <= i0 + 3; ++i) {
-            if (i < 1 || j < 1 || i >= C.w - 1 || j >= C.h - 1)
-                continue;
-            const float v[4] = { C.at(i - 1, j - 1), C.at(i + 1, j - 1),
-                                 C.at(i - 1, j + 1), C.at(i + 1, j + 1) };
-            const float yk = C.at(i, j);
-            for (int p = 0; p < 4; ++p) {
-                for (int q = 0; q < 4; ++q) R[p][q] += v[p] * v[q];
-                r[p] += v[p] * yk;
-            }
-        }
-    for (int p = 0; p < 4; ++p) R[p][p] += float(eps);
-    float a[4];
-    solve4x4(R, r, a);
-    const float v[4] = { C.at(i0, j0), C.at(i0 + 1, j0),
-                         C.at(i0, j0 + 1), C.at(i0 + 1, j0 + 1) };
-    float out = a[0] * v[0] + a[1] * v[1] + a[2] * v[2] + a[3] * v[3];
-    if (arMargin >= 0.0) {
-        float mn = std::min(std::min(v[0], v[1]), std::min(v[2], v[3]));
-        float mx = std::max(std::max(v[0], v[1]), std::max(v[2], v[3]));
-        out = std::clamp(out, mn - float(arMargin), mx + float(arMargin));
-    }
-    return out;
-}
-
-void nediChroma(const Plane &U, const Plane &V, Plane &outU, Plane &outV,
-                       const ChromaAxis &ax, const ChromaAxis &ay,
-                       const Plane &plainU, const Plane &plainV,
-                       float lam, double eps, double arMargin) {
-    for (int oy = 0; oy < outU.h; ++oy) {
-        const float scy = ay.pos[oy];
-        for (int ox = 0; ox < outU.w; ++ox) {
-            const float scx = ax.pos[ox];
-            // coincident with a source sample: passthrough
-            const float fx = scx - std::floor(scx);
-            const float fy = scy - std::floor(scy);
-            if (std::min(fx, 1.0f - fx) < 1e-3f && std::min(fy, 1.0f - fy) < 1e-3f)
-                continue; // keep plain (which is the source sample here)
-            const float nu = nediPixel(U, scx, scy, eps, arMargin);
-            const float nv = nediPixel(V, scx, scy, eps, arMargin);
-            float *ru = outU.row(oy);
-            float *rv = outV.row(oy);
-            ru[ox] = (1.0f - lam) * plainU.row(oy)[ox] + lam * nu;
-            rv[ox] = (1.0f - lam) * plainV.row(oy)[ox] + lam * nv;
-        }
-    }
-}
-
 
 void sharpenPlane(Plane &p, const Plane *guideLc, const Plane &guideY,
                          double rw, double rh, double shiftX, double shiftY,

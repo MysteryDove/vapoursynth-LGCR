@@ -121,13 +121,13 @@ struct LGCRData {
     double sigma = 0.01;             // luminance similarity sigma floor (normalized)
     double sratio = 0.15;            // adaptive sigma = max(sigma, sratio * window luma range)
     double sdb = 3.0;                // sigma multiplier (x window range) on ramps vs steps
-    double reg = 0.005;              // algo=3/5/6 regression regularization (normalized units)
+    double reg = 0.005;              // algo=4/6 regression regularization (normalized units)
     double stretch = 1.0;            // along-edge support stretch (0 = isotropic)
     double gsigma = 2.5;             // guided-bump width sigma (luma px)
-    int algo = 2;                    // 1=v1.2, 2=v1.3, 3=LGF, 4=selector, 5=NEDI, 6=detail
+    int algo = 2;                    // 2=guided selector, 4=hybrid selector, 6=detail transfer
     bool ridge = true;               // thin-line (ridge) detection (algo 2/4)
     bool cedge = false;              // EXPERIMENTAL: wide-chroma-transition fade (off, see README)
-    double ms = 1.0;                 // mutual-structure gate strength (algo 2/3/4/6, TRecon)
+    double ms = 1.0;                 // mutual-structure gate strength (algo 2/4/6, TRecon)
     double qgate = 1.0;              // algo=6 affine-credibility gate strength [0,1]
     bool sparse = true;              // sparse correction: guide only near luma structure
     bool locSet = false;             // loc param explicitly given (else read _ChromaLocation)
@@ -210,13 +210,12 @@ struct GuideMaps {
     Plane jxx;  // full-res structure tensor components (3x3 box-smoothed
     Plane jxy;  //   outer products of the Sobel gradient). Orientation and
     Plane jyy;  //   coherence come from the eigensystem, not raw gradients.
-    Plane db;   // full-res median |4-neighbor luma diff| (algo=1 slope floor)
     Plane lc;   // chroma-res luma level of each chroma sample (footprint average)
     Plane ms;   // chroma-res mutual-structure co-edge gate [0,1] (empty if off)
 };
 
 GuideMaps buildGuideMaps(const Plane &structY, const Plane &lcY, int cw, int ch,
-                         double rw, double rh, double shiftX, double shiftY, bool needDb);
+                         double rw, double rh, double shiftX, double shiftY);
 
 // Mutual-structure co-edge gate at chroma res (maps.cpp). rho-correlation of
 // luma/chroma gradient profiles along the luma edge normal; 1 = confirmed
@@ -295,7 +294,6 @@ struct TemporalNbr;
 struct ChromaJob {
     const Plane *srcU, *srcV;  // source chroma (chroma res)
     const Plane *srcY;         // source luma (full res, for tap-level stats)
-    const Plane *outY = nullptr; // OUTPUT-space luma (guide center/direction probes)
     const GuideMaps *gm;       // guide maps (built in output space)
     Plane *dstU, *dstV;        // output chroma (output luma res)
     int srcLumaW, srcLumaH;    // source luma dimensions
@@ -341,7 +339,7 @@ ChromaAxis buildChromaAxis(int srcLumaN, int dstLumaN, double r, double sitShift
 void reconstructChroma(const ChromaJob &job);
 
 // Plain (unguided) chroma reconstruction: separable fast path for separable
-// kernels, 2D radial path for jinc. Base for algo 3/4/5 and the strength=0
+// kernels, 2D radial path for jinc. Base for algo 4/6 and the strength=0
 // A/B reference.
 void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
                  const Plane &y, const GuideMaps &gm,
@@ -352,7 +350,7 @@ void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
 // Alternative algorithms (algos.cpp)
 // ---------------------------------------------------------------------------
 
-// LGF coefficient planes for both chroma planes (algo 3/4)
+// Internal LGF coefficient planes for the algo=4 selector branch.
 struct LGFMaps {
     Plane aU, bU, confU, aV, bV, confV;
     LGFMaps(int cw, int ch) : aU(cw, ch), bU(cw, ch), confU(cw, ch),
@@ -365,12 +363,6 @@ void buildLGF(const Plane &Y, int cw, int ch, double rw, double rh,
 
 LGFMaps buildLGFMaps(const LGCRData *d, const Plane &y, const Plane &cb,
                      const Plane &cr, int cw, int ch, double rw, double rh);
-
-void blendLGF(Plane &outU, Plane &outV,
-              const Plane &aU, const Plane &bU, const Plane &aV, const Plane &bV,
-              const Plane &confU, const Plane &confV, const Plane &Y,
-              const ChromaAxis &ax, const ChromaAxis &ay,
-              int cw, int ch, float lam);
 
 void blendSelector(Plane &outU, Plane &outV,
                    const Plane &gU, const Plane &gV,
@@ -430,11 +422,6 @@ void applyChromaConsistency(const Plane &curU, const Plane &curV,
                             const std::vector<int16_t> &mvx,
                             const std::vector<int16_t> &mvy,
                             int bw, int bh, std::vector<float> &conf);
-
-void nediChroma(const Plane &U, const Plane &V, Plane &outU, Plane &outV,
-                const ChromaAxis &ax, const ChromaAxis &ay,
-                const Plane &plainU, const Plane &plainV,
-                float lam, double eps, double arMargin);
 
 // ---------------------------------------------------------------------------
 // Sharpen: gated Laplacian (bilateral USM)

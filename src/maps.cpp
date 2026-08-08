@@ -28,14 +28,12 @@ BilinAxis buildBilinAxis(const std::vector<float> &pos, int srcN) {
 
 
 GuideMaps buildGuideMaps(const Plane &structY, const Plane &lcY, int cw, int ch,
-                                double rw, double rh, double shiftX, double shiftY, bool needDb) {
+                                double rw, double rh, double shiftX, double shiftY) {
     const Plane &y = structY; // structure tensor / db built in OUTPUT space
     GuideMaps m;
     m.jxx = Plane(y.w, y.h);
     m.jxy = Plane(y.w, y.h);
     m.jyy = Plane(y.w, y.h);
-    if (needDb)
-        m.db = Plane(y.w, y.h);
     m.lc = Plane(cw, ch);
 
     // Full-resolution Sobel gradients
@@ -47,19 +45,6 @@ GuideMaps buildGuideMaps(const Plane &structY, const Plane &lcY, int cw, int ch,
             const float bl = y.at(i - 1, j + 1), b = y.at(i, j + 1), br = y.at(i + 1, j + 1);
             gx.at(i, j) = (tr + 2 * r + br - tl - 2 * l - bl) * 0.125f;
             gy.at(i, j) = (bl + 2 * b + br - tl - 2 * t - tr) * 0.125f;
-
-            if (needDb) {
-                // algo=1 baseline: median |4-neighbor diff|. ~0 along an
-                // axis-aligned step, = slope on a ramp. (Known limitation:
-                // overestimates on diagonal steps — fixed in algo=2.)
-                const float c0 = y.at(i, j);
-                float diffs[4] = {
-                    std::fabs(r - c0), std::fabs(l - c0),
-                    std::fabs(b - c0), std::fabs(t - c0),
-                };
-                std::sort(diffs, diffs + 4);
-                m.db.at(i, j) = (diffs[1] + diffs[2]) * 0.5f;
-            }
         }
     }
     // Structure tensor: 3x3 box-smoothed outer products. The dominant

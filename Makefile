@@ -32,7 +32,7 @@ check: $(TARGET) liblgcr_scalar.so
 	$(PYTHON) test/test_lgcr.py
 	$(PYTHON) test/test_algo6.py
 	$(PYTHON) test/test_regressions.py
-	$(PYTHON) test/battery.py --check
+	$(PYTHON) test/battery.py --all --check
 
 asan-check: liblgcr_asan.so
 	ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 \

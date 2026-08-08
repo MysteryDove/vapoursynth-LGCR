@@ -20,7 +20,7 @@ Cases:
 
 Usage: python3 test/battery.py [--all] [--check] [--write-results]
 
---all runs algo 1..6 (default: plain+algo2), --check enables the quality gates,
+--all runs the retained algos 2/4/6 (default: plain+algo2), --check enables the quality gates,
 and result files are only updated when --write-results is explicit.
 """
 import math
@@ -74,9 +74,6 @@ def run_case(name, Yf, Uf, Vf, mask, algos, scale=1.0):
         mask = np.kron(mask, np.ones((2, 2))) > 0  # 2x nearest expansion of mask
     res = {}
     for tag, kw in algos.items():
-        if scale != 1.0 and kw.get("algo") == 5:
-            res[tag] = float("nan")  # algo5 is same-size only; plugin rejects scaling
-            continue
         out = core.lgcr.Recon(src420, width=ow, height=oh, kernel="jinc", taps=3, **kw).get_frame(0)
         res[tag] = (mae_band(out, fgt, 1, mask) + mae_band(out, fgt, 2, mask)) / 2
     return res
@@ -333,7 +330,7 @@ def check_gates(case_results, temporal_results, int8_ok):
 def main():
     algos = {"plain": dict(strength=0.0), "algo2": dict(strength=0.8, algo=2)}
     if "--all" in sys.argv:
-        for a in (1, 3, 4, 5, 6):
+        for a in (4, 6):
             algos[f"algo{a}"] = dict(strength=0.8, algo=a)
 
     cases = build_cases()

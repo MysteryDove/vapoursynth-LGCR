@@ -49,6 +49,20 @@ def test_invalid_taps():
     print("invalid taps are recoverable: OK")
 
 
+def test_retired_algorithms():
+    clip = core.std.BlankClip(width=16, height=16, format=F420, length=1)
+    for algo in (1, 3, 5):
+        try:
+            core.lgcr.Recon(clip, algo=algo).get_frame(0)
+        except vs.Error as exc:
+            assert "2 (guided), 4 (selector) or 6" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"retired algo={algo} was accepted")
+    assert_finite(core.lgcr.Recon(clip, algo=2).get_frame(0),
+                  "host after retired algorithms")
+    print("retired algorithms are rejected: OK")
+
+
 def make_420(width, height, length, fill):
     blank = core.std.BlankClip(width=width, height=height, format=F420, length=length)
 
@@ -124,6 +138,7 @@ def test_444_identity():
 
 test_degenerate_axes()
 test_invalid_taps()
+test_retired_algorithms()
 if "--asan" not in sys.argv:
     test_temporal_chroma_gate()
     test_boundary_deduplication()
