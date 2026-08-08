@@ -217,6 +217,11 @@ Plane buildMutualGate(const Plane &lc, const Plane &U, const Plane &V, double si
 Plane buildLcMap(const Plane &lcY, int cw, int ch, double rw, double rh,
                  double shiftX, double shiftY);
 
+// Candidate encoder degradation D^(Y) to the chroma grid:
+// kind 0 = box footprint (== buildLcMap), 1 = triangle/bilinear, 2 = bicubic.
+Plane buildYcMap(const Plane &Y, int cw, int ch, double rw, double rh,
+                 double shiftX, double shiftY, int kind);
+
 // Sparse trust mask: 1 where the output pixel's support window may touch a
 // luma structure worth guiding by (tensor energy over threshold), dilated by
 // the support radius. 0 = plain kernel is provably sufficient.
@@ -366,6 +371,38 @@ void blendSelector(Plane &outU, Plane &outV,
                    int cw, int ch, float lam);
 
 void backProject(Plane &cOut, const Plane &cSrc, float bp);
+
+// ---------------------------------------------------------------------------
+// algo=6: constrained detail transfer (maps + application)
+//
+//   C0 = P(C420)            plain kernel base (low freq / color reference)
+//   Yc = D^(Y), Yb = P(Yc)  matched-degradation luma and its plain upsample
+//   C1 = C0 + g * a * lp_tangent(Y - Yb)
+//
+// a is the chroma-grid regression slope, q-weight-averaged over candidate
+// degradation kernels {box, triangle, bicubic}; g composites the joint-U/V
+// affine credibility q, multi-kernel stability, chroma significance, and
+// (at application time) the mutual-structure gate and strength. The detail
+// field is binomially low-passed before transfer: the (-1)^x luma Nyquist
+// mode sits in the null space of EVERY symmetric 2x decimation kernel, so
+// no low-res statistic can ever confirm it — projecting it out is the only
+// defense (the review's null-space counterexample).
+struct AffineMaps {
+    Plane aU, aV;      // regression slope per chroma sample (chroma res)
+    Plane g;           // composite confidence before ms/strength (chroma res)
+    Plane yb;          // P(Yc): plain-upsampled matched luma (output res)
+    Plane mnU, mxU, mnV, mxV; // 5x5 window hull per plane (chroma res)
+    Plane rng;         // max(U,V) window range, for the magnitude cap
+    AffineMaps() = default;
+};
+
+AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
+                           const Plane &cr, int cw, int ch, double rw, double rh);
+
+void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
+                    const Plane &yOut, const AffineMaps &af, const GuideMaps &gm,
+                    const ChromaAxis &ax, const ChromaAxis &ay,
+                    const uint8_t *mask, int maskW, int maskH);
 
 // Integer-pel luma block matching (TRecon). Fills mvx/mvy/conf on a
 // blockSize grid; conf = matchQuality x observability, where observability

@@ -378,4 +378,174 @@ void blockMatch(const Plane &cur, const Plane &nbr, int blockSize, int search,
         }
 }
 
+// ---------------------------------------------------------------------------
+// algo=6: constrained detail transfer
+// ---------------------------------------------------------------------------
+
+AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
+                           const Plane &cr, int cw, int ch, double rw, double rh) {
+    AffineMaps m;
+    m.aU = Plane(cw, ch);
+    m.aV = Plane(cw, ch);
+    m.g = Plane(cw, ch);
+    m.mnU = Plane(cw, ch);
+    m.mxU = Plane(cw, ch);
+    m.mnV = Plane(cw, ch);
+    m.mxV = Plane(cw, ch);
+    m.rng = Plane(cw, ch);
+
+    const double eps = d->reg * d->reg;
+    const double epsSig = (0.25 * d->sigma) * (0.25 * d->sigma);
+    // Candidate encoder degradations (unknown D: accept only stable conclusions)
+    const Plane yc[3] = { buildYcMap(y, cw, ch, rw, rh, d->shiftX, d->shiftY, 0),
+                          buildYcMap(y, cw, ch, rw, rh, d->shiftX, d->shiftY, 1),
+                          buildYcMap(y, cw, ch, rw, rh, d->shiftX, d->shiftY, 2) };
+    const int r = 2;
+    for (int cy = 0; cy < ch; ++cy) {
+        for (int cx = 0; cx < cw; ++cx) {
+            const int x0 = std::max(0, cx - r), x1 = std::min(cw - 1, cx + r);
+            const int y0 = std::max(0, cy - r), y1 = std::min(ch - 1, cy + r);
+            // chroma window moments (kernel-independent)
+            double sU = 0, sU2 = 0, sV = 0, sV2 = 0;
+            float mnU = 1e30f, mxU = -1e30f, mnV = 1e30f, mxV = -1e30f;
+            int n = 0;
+            for (int j = y0; j <= y1; ++j)
+                for (int i = x0; i <= x1; ++i) {
+                    const double u = cb.at(i, j), v = cr.at(i, j);
+                    sU += u; sU2 += u * u; sV += v; sV2 += v * v;
+                    mnU = std::min(mnU, float(u)); mxU = std::max(mxU, float(u));
+                    mnV = std::min(mnV, float(v)); mxV = std::max(mxV, float(v));
+                    ++n;
+                }
+            const double varU = std::max(0.0, sU2 / n - (sU / n) * (sU / n));
+            const double varV = std::max(0.0, sV2 / n - (sV / n) * (sV / n));
+            m.mnU.at(cx, cy) = mnU; m.mxU.at(cx, cy) = mxU;
+            m.mnV.at(cx, cy) = mnV; m.mxV.at(cx, cy) = mxV;
+            m.rng.at(cx, cy) = std::max(mxU - mnU, mxV - mnV);
+
+            double qk[3], aUk[3], aVk[3];
+            for (int k = 0; k < 3; ++k) {
+                double sY = 0, sY2 = 0, sYU = 0, sYV = 0;
+                for (int j = y0; j <= y1; ++j)
+                    for (int i = x0; i <= x1; ++i) {
+                        const double ly = yc[k].at(i, j);
+                        sY += ly; sY2 += ly * ly;
+                        sYU += ly * cb.at(i, j);
+                        sYV += ly * cr.at(i, j);
+                    }
+                const double meanY = sY / n;
+                const double varY = std::max(0.0, sY2 / n - meanY * meanY);
+                const double covU = sYU / n - meanY * (sU / n);
+                const double covV = sYV / n - meanY * (sV / n);
+                aUk[k] = std::clamp(covU / (varY + eps), -16.0, 16.0);
+                aVk[k] = std::clamp(covV / (varY + eps), -16.0, 16.0);
+                qk[k] = std::clamp((covU * covU + covV * covV) /
+                                       ((varY + eps) * (varU + varV + eps)),
+                                   0.0, 1.0);
+            }
+            const double qsum = qk[0] + qk[1] + qk[2];
+            const double qmax = std::max({qk[0], qk[1], qk[2]});
+            const double qmin = std::min({qk[0], qk[1], qk[2]});
+            if (qsum > 1e-9) {
+                m.aU.at(cx, cy) = float((qk[0] * aUk[0] + qk[1] * aUk[1] + qk[2] * aUk[2]) / qsum);
+                m.aV.at(cx, cy) = float((qk[0] * aVk[0] + qk[1] * aVk[1] + qk[2] * aVk[2]) / qsum);
+            }
+            const double qMean = qsum / 3.0;
+            const double stab = qmax > 1e-9 ? qmin / qmax : 0.0; // multi-kernel agreement
+            const double sigC = (varU + varV) / (varU + varV + epsSig);
+            m.g.at(cx, cy) = float(qMean * stab * sigC);
+        }
+    }
+    // Yb = P(Yc): the matched luma put through the SAME plain kernel path as
+    // the chroma base, so (Y - Yb) is exactly the detail the plain path lost.
+    GuideMaps gmEmpty; // plain path never reads guide maps
+    m.yb = Plane(d->outW, d->outH);
+    Plane dummy(d->outW, d->outH);
+    plainChroma(d, yc[0], yc[0], y, gmEmpty, y.w, y.h, cw, ch, m.yb, dummy);
+    return m;
+}
+
+void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
+                    const Plane &yOut, const AffineMaps &af, const GuideMaps &gm,
+                    const ChromaAxis &ax, const ChromaAxis &ay,
+                    const uint8_t *mask, int maskW, int maskH) {
+    const int ow = outU.w, oh = outU.h;
+    // Detail field, then null-space projection: separable binomial [1,2,1]
+    // kills the luma Nyquist mode that no symmetric 2x decimation kernel can
+    // observe at chroma rate (the unprovable component must not transfer).
+    Plane dl(ow, oh);
+    {
+        Plane df(ow, oh);
+        for (int j = 0; j < oh; ++j)
+            for (int i = 0; i < ow; ++i)
+                df.at(i, j) = yOut.at(i, j) - af.yb.at(i, j);
+        for (int j = 0; j < oh; ++j)
+            for (int i = 0; i < ow; ++i)
+                dl.at(i, j) = 0.25f * df.at(i - 1, j) + 0.5f * df.at(i, j) + 0.25f * df.at(i + 1, j);
+        for (int j = 0; j < oh; ++j)
+            for (int i = 0; i < ow; ++i)
+                dl.at(i, j) = 0.25f * dl.at(i, j - 1) + 0.5f * dl.at(i, j) + 0.25f * dl.at(i, j + 1);
+    }
+    const BilinAxis bcx = buildBilinAxis(ax.pos, af.g.w);
+    const BilinAxis bcy = buildBilinAxis(ay.pos, af.g.h);
+    const BilinAxis blx = buildBilinAxis(ax.lpos, gm.jxx.w);
+    const BilinAxis bly = buildBilinAxis(ay.lpos, gm.jxx.h);
+    const bool useMs = d->ms > 0.0 && gm.ms.w > 0;
+    const float strength = float(d->strength);
+    const float ar = float(std::max(0.0, d->arMargin));
+    const bool clampHull = d->arMargin >= 0.0;
+
+    for (int oy = 0; oy < oh; ++oy) {
+        float *ru = outU.row(oy);
+        float *rv = outV.row(oy);
+        const int cyi = bcy.i0[oy], lyi = bly.i0[oy];
+        const float cyf = bcy.f[oy], lyf = bly.f[oy];
+        for (int ox = 0; ox < ow; ++ox) {
+            if (mask && !mask[size_t(std::min(maskH - 1, oy * maskH / oh)) * maskW
+                              + std::min(maskW - 1, ox * maskW / ow)])
+                continue;
+            const int cxi = bcx.i0[ox];
+            const float cxf = bcx.f[ox];
+            float g = bilinearFast(af.g, cxi, cxf, cyi, cyf) * strength;
+            if (useMs)
+                g *= bilinearFast(gm.ms, cxi, cxf, cyi, cyf);
+            if (g < 1e-3f)
+                continue;
+            const float au = bilinearFast(af.aU, cxi, cxf, cyi, cyf);
+            const float av = bilinearFast(af.aV, cxi, cxf, cyi, cyf);
+            // Edge normal/coherence from the luma tensor (source-space probe)
+            const float jxx = bilinearFast(gm.jxx, blx.i0[ox], blx.f[ox], lyi, lyf);
+            const float jxy = bilinearFast(gm.jxy, blx.i0[ox], blx.f[ox], lyi, lyf);
+            const float jyy = bilinearFast(gm.jyy, blx.i0[ox], blx.f[ox], lyi, lyf);
+            const float jdiff = jxx - jyy, jsum = jxx + jyy;
+            const float coherence = std::sqrt(jdiff * jdiff + 4.0f * jxy * jxy) / (jsum + 1e-12f);
+            const float theta = 0.5f * std::atan2(2.0f * jxy, jdiff);
+            // tangent = (-sin, cos)... normal n=(cos,sin); tangent t=(-ny,nx)
+            const float tx = -std::sin(theta), ty = std::cos(theta);
+            // 1D restriction: smooth the detail along the edge tangent so
+            // tangential luma texture is never injected into chroma
+            const float dc = dl.at(ox, oy);
+            const float s = 1.0f + float(d->stretch) * coherence;
+            const float dtp = bilinear(dl, ox + tx * s, oy + ty * s);
+            const float dtm = bilinear(dl, ox - tx * s, oy - ty * s);
+            const float dt = 0.25f * dtp + 0.5f * dc + 0.25f * dtm;
+            const float det = dc + (dt - dc) * coherence;
+            // magnitude cap: correction may not exceed half the local chroma range
+            const float cap = 0.5f * bilinearFast(af.rng, cxi, cxf, cyi, cyf);
+            float cu = std::clamp(g * au * det, -cap, cap);
+            float cv = std::clamp(g * av * det, -cap, cap);
+            float ou = ru[ox] + cu;
+            float ov = rv[ox] + cv;
+            if (clampHull) {
+                ou = std::clamp(ou, bilinearFast(af.mnU, cxi, cxf, cyi, cyf) - ar,
+                                bilinearFast(af.mxU, cxi, cxf, cyi, cyf) + ar);
+                ov = std::clamp(ov, bilinearFast(af.mnV, cxi, cxf, cyi, cyf) - ar,
+                                bilinearFast(af.mxV, cxi, cxf, cyi, cyf) + ar);
+            }
+            ru[ox] = ou;
+            rv[ox] = ov;
+        }
+    }
+}
+
 } // namespace lgcr

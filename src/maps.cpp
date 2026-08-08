@@ -138,6 +138,52 @@ Plane buildLcMap(const Plane &lcY, int cw, int ch, double rw, double rh,
     return lc;
 }
 
+// Candidate encoder degradation D^(Y): luma resampled to the chroma grid with
+// a specific kernel (0=box footprint, 1=triangle/bilinear, 2=bicubic b0c0.6),
+// honoring siting. Used by the affine-credibility machinery (algo=6): the
+// true encoder kernel is unknown, so statistics are computed per candidate
+// and only accepted when they agree (multi-kernel stability).
+Plane buildYcMap(const Plane &Y, int cw, int ch, double rw, double rh,
+                 double shiftX, double shiftY, int kind) {
+    if (kind == 0)
+        return buildLcMap(Y, cw, ch, rw, rh, shiftX, shiftY);
+    const double sup = (kind == 1) ? 1.0 : 2.0; // kernel support in chroma units
+    Plane out(cw, ch);
+    for (int cy = 0; cy < ch; ++cy)
+        for (int cx = 0; cx < cw; ++cx) {
+            const double lx = (cx + 0.5) * rw - 0.5 + shiftX;
+            const double ly = (cy + 0.5) * rh - 0.5 + shiftY;
+            const int x0 = int(std::floor(lx - sup * rw)), x1 = int(std::ceil(lx + sup * rw));
+            const int y0 = int(std::floor(ly - sup * rh)), y1 = int(std::ceil(ly + sup * rh));
+            double sum = 0, wsum = 0;
+            for (int j = y0; j <= y1; ++j) {
+                const double dy = std::fabs(j - ly) / rh;
+                double wy;
+                if (kind == 1)
+                    wy = std::max(0.0, 1.0 - dy);
+                else
+                    wy = kernelEval(Kernel::Bicubic, dy, 0.0, 0.6);
+                if (wy == 0.0)
+                    continue;
+                for (int i = x0; i <= x1; ++i) {
+                    const double dx = std::fabs(i - lx) / rw;
+                    double wx;
+                    if (kind == 1)
+                        wx = std::max(0.0, 1.0 - dx);
+                    else
+                        wx = kernelEval(Kernel::Bicubic, dx, 0.0, 0.6);
+                    if (wx == 0.0)
+                        continue;
+                    const double w = wx * wy;
+                    sum += w * Y.at(i, j);
+                    wsum += w;
+                }
+            }
+            out.at(cx, cy) = static_cast<float>(wsum > 0.0 ? sum / wsum : Y.at(int(lx), int(ly)));
+        }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Mutual-structure co-edge gate (review item 5)
 //

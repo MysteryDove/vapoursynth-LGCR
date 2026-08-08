@@ -363,11 +363,14 @@ def main():
         gtV = np.asarray(fgt[2]).astype(np.float64)
         maes = {}
         for tag, kw in (("plain", dict(strength=0.0)),
-                        ("ungated", dict(strength=0.8, algo=2, ms=0, cedge=0))):
+                        ("ungated", dict(strength=0.8, algo=2, ms=0, cedge=0)),
+                        ("algo6_ms0", dict(strength=0.8, algo=6, ms=0)),
+                        ("algo6", dict(strength=0.8, algo=6))):
             f = core.lgcr.Recon(src420, kernel="jinc", taps=3, **kw).get_frame(0)
             maes[tag] = (np.abs(np.asarray(f[1]).astype(np.float64) - gtU)[band].mean()
                          + np.abs(np.asarray(f[2]).astype(np.float64) - gtV)[band].mean()) / 2
         delta = maes["ungated"] - maes["plain"]
+        delta6 = maes["algo6_ms0"] - maes["plain"]  # detail-transfer label for q/ms
 
         # statistics from the same planes the plugin sees
         fs = src420.get_frame(0)
@@ -380,7 +383,8 @@ def main():
         qb = q_map(Y.astype(np.float64), U420, V420, "box")[bcm].mean()
         qt = q_map(Y.astype(np.float64), U420, V420, "tri")[bcm].mean()
         qc = q_map(Y.astype(np.float64), U420, V420, "bic")[bcm].mean()
-        rows.append(dict(name=name, delta=delta,
+        rows.append(dict(name=name, delta=delta, delta6=delta6,
+                         gain6=maes["algo6"] - maes["plain"],
                          cedge_cur=stat_cedge_cur(U420, V420, nxm, nym, bcm),
                          cedge_eq=stat_cedge_eq(U420, V420, nxm, nym, bcm),
                          ms=ms, q_box=qb, q_tri=qt, q_bic=qc,
@@ -411,6 +415,32 @@ def main():
             t = thr[k]
             acc = [r for r in labeled if r[s] >= t]
             risk = np.mean([r["delta"] for r in acc])
+            line += f"cov{int(cov*100)}%:{risk:+.4f}  "
+        print(line)
+
+    # --- algo=6 label: detail transfer (ms=0) vs plain --------------------
+    # This is the label q was designed for: "does the affine detail transfer
+    # help here". Statistics are scored against it, plus the q x ms composite.
+    print("\n--- label: algo=6 detail transfer (ms=0) vs plain ---")
+    labeled6 = [r for r in rows if abs(r["delta6"]) > eps]
+    pos6 = [r for r in labeled6 if r["delta6"] < 0]
+    neg6 = [r for r in labeled6 if r["delta6"] > 0]
+    print(f"{len(labeled6)} labeled ({len(pos6)} benefit / {len(neg6)} harm); "
+          f"mean delta6 = {np.mean([r['delta6'] for r in rows]):+.5f}, "
+          f"mean algo6(full) delta = {np.mean([r['gain6'] for r in rows]):+.5f}")
+    for r in rows:
+        r["qxms"] = r["q_min"] * r["ms"]
+    for s in ("q_box", "q_min", "ms", "qxms"):
+        p = np.array([r[s] for r in pos6])
+        n = np.array([r[s] for r in neg6])
+        auc = float((p[:, None] > n[None, :]).mean() + 0.5 * (p[:, None] == n[None, :]).mean()) if len(p) and len(n) else float("nan")
+        line = f"{s:<10} {auc:>6.3f}   "
+        for cov in (0.5, 0.75, 1.0):
+            thr = np.sort([r[s] for r in labeled6])[::-1]
+            k = max(1, int(round(cov * len(thr)))) - 1
+            t = thr[k]
+            acc = [r for r in labeled6 if r[s] >= t]
+            risk = np.mean([r["delta6"] for r in acc])
             line += f"cov{int(cov*100)}%:{risk:+.4f}  "
         print(line)
 
