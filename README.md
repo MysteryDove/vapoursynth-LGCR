@@ -115,7 +115,8 @@ out = core.lgcr.TRecon(src420, trad=2, tsearch=8) # 更大窗口/搜索范围
 ```
 
 机制：亮度块匹配（16×16，整数像素，SAD）把邻帧色度样本对齐到当前帧坐标，
-作为额外 tap 注入引导权重循环。**相位分集**：**奇数**亮度像素位移使 420 采样
+并以块内运动补偿联合色度差的中位数拒绝换色邻帧，再把通过的样本作为额外 tap
+注入引导权重循环。**相位分集**：**奇数**亮度像素位移使 420 采样
 相位平移半个色度像素，邻帧样本携带真正的新采样信息；偶数位移（整数色度
 像素）只是同相位重采样，对运动块被精确门控为零（t_move2 与单帧 Recon 完全
 持平——不再虚报收益）。静态块（|mv|≤1 且高置信）的冗余 tap 是纯时域平均
@@ -162,7 +163,7 @@ vspipe --y4m script.vpy - | ffmpeg -i - -c:v libx265 -crf 16 out.mkv
 | `width`/`height` | 输入尺寸 | 输出尺寸（不填 = 纯色度重建模式） |
 | `loc` | 未设时读 `_ChromaLocation` | 水平 siting；垂直 siting 由 H.273 属性（topleft/top/bottomleft/bottom）自动处理；输出 444 会删除该属性 |
 | `kernel` | `"lanczos"` | `"bilinear"` / `"bicubic"`(b,c 可调) / `"lanczos"`(taps) / `"spline16"` / `"spline36"` / `"jinc"`(taps) |
-| `taps` | 3 | lanczos/jinc 的瓣数 |
+| `taps` | 3 | lanczos/jinc 的瓣数，接受范围 `1..64`；越界作为插件参数错误返回 |
 | `algo` | 2 | 重建算法：`1`=v1.2 历史版；`2`=v1.3 引导选择（默认）；`3`=LGF 局部线性回归；`4`=逐像素选择器；`5`=NEDI-lite（仅同尺寸）；`6`=受约束细节迁移（实验性） |
 | `strength` | 0.8 | 引导/修正强度 λ；**0 = 纯核**（A/B 对照基准） |
 | `sigma` | 0.01 | 亮度相似度 σ 下限（归一化单位），相当于噪声地板 |
@@ -207,8 +208,10 @@ vspipe --y4m script.vpy - | ffmpeg -i - -c:v libx265 -crf 16 out.mkv
 | `strength`/`sigma`/`sratio`/`sdb`/`gsigma`/`stretch`/`ar`/`ridge`/`ms` | 同 Recon | 引导参数，语义同 Recon（algo=2 路径） |
 | `sparse` | 0 | TRecon 默认密集（静态区的时域平均降噪是收益的一部分） |
 
-时域 tap 权重：`w = tconf · sim · W_kernel(真实偏移) · 相位新颖度`。
+时域 tap 权重：`w = tconf · cconf · sim · W_kernel(真实偏移) · 相位新颖度`。
 - `tconf` = 匹配质量 × 可观测性（亮度块方差；平坦块运动不可观测 → 0）；
+- `cconf = 1/(1+(medianDelta/0.04)^4)`，`medianDelta` 是每个 16×16 亮度块内
+  运动补偿后 `max(|ΔU|,|ΔV|)` 的中位数；`tconf·cconf < 0.05` 时整块邻帧 tap 被拒绝；
 - 运动块的 `sim` 用**源亮度 footprint 骑跨测试**（运动补偿后 footprint 内任一
   亮度样本与 L0 的最大差）× 0.5σ 裸 sim——色度分辨率亮度水平对边缘列的
   部分骑跨是盲的，这是奇数位移曾回归 0.0234 的根因；
@@ -315,7 +318,8 @@ hull clamp。门控拉普拉斯：边缘处 HP≈0（无 halo 的来源），软
 
 ### 可复现评测电池（test/battery.py，v1.9）
 
-`python3 test/battery.py [--all]`，结果写入 `test/results/latest.md`。
+`python3 test/battery.py [--all] [--check] [--write-results]`。`--check` 启用质量
+断言且不写文件；只有显式 `--write-results` 才更新 `test/results/latest.md`。
 当前成绩（jinc3，strength=0.8；strength 是连续的，0.8 ≠ 全强度）：
 
 | case | plain | algo2 | algo3 | algo4 | algo6 |
@@ -384,8 +388,9 @@ box / triangle / bicubic 生成实际 420，共 468 个观测。q 使用 C++ 同
 TRecon 的可验证收益是静态降噪与"无退化保证"；奇数相位分集在超锐合成边缘
 上与单帧持平（footprint 骑跨测试为安全牺牲了这部分理论收益）。
 
-**strength 连续性验证**：0 与 1e-6 逐位一致（全部可分离核），0.2/0.5/0.8/1.0
-单调过渡。
+**strength 连续性验证**：回归集覆盖 `0、1e-6、0.000999、0.001、0.001001`；
+跨旧 `1e-3` 边界的步长不超过总 correction 的 1% 加 `1e-7`。hull 始终包含
+plain 基值，因此任意正 strength 只限制新增 correction，不会突然改写 plain 输出。
 
 ### 真实图像（动画截图 1920×1080，当前实现）
 

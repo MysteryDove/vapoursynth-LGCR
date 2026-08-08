@@ -9,6 +9,11 @@ BilinAxis buildBilinAxis(const std::vector<float> &pos, int srcN) {
     a.n = static_cast<int>(pos.size());
     a.i0.resize(a.n);
     a.f.resize(a.n);
+    if (srcN == 1) {
+        std::fill(a.i0.begin(), a.i0.end(), 0);
+        std::fill(a.f.begin(), a.f.end(), 0.0f);
+        return a;
+    }
     for (int i = 0; i < a.n; ++i) {
         float x = pos[i];
         int j = static_cast<int>(std::floor(x));

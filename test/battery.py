@@ -18,7 +18,10 @@ Cases:
   nullspace_x/y/xy   - targeted axis/checker Nyquist aliases in luma only
   temporal           - two frames, edge moves 1 luma px: aligned error variance
 
-Usage: python3 test/battery.py [--all]   (--all runs algo 1..6, default plain+algo2)
+Usage: python3 test/battery.py [--all] [--check] [--write-results]
+
+--all runs algo 1..6 (default: plain+algo2), --check enables the quality gates,
+and result files are only updated when --write-results is explicit.
 """
 import math
 import os
@@ -296,6 +299,37 @@ def run_int8_case():
     return res, ok
 
 
+def check_gates(case_results, temporal_results, int8_ok):
+    def pair(name):
+        row = case_results[name]
+        return row["plain"], row["algo2"]
+
+    assert int8_ok, "integer Recon/TRecon round-trip failed"
+    assert temporal_results["t_single"]["isolation_maxdiff"] <= 1e-6, (
+        f"single-frame TRecon isolation failed: {temporal_results['t_single']}")
+    assert abs(temporal_results["t_move2"]["trecon"] -
+               temporal_results["t_move2"]["algo2"]) <= 1e-6, (
+        f"even-pixel motion must not add temporal gain: {temporal_results['t_move2']}")
+    assert temporal_results["t_flat_amb"]["trecon"] <= (
+        temporal_results["t_flat_amb"]["algo2"] + 1e-6), (
+        f"flat-luma motion ambiguity regressed: {temporal_results['t_flat_amb']}")
+    assert temporal_results["t_static_noise"]["trecon"] < (
+        temporal_results["t_static_noise"]["algo2"]), (
+        f"TRecon must improve static noise: {temporal_results['t_static_noise']}")
+
+    for name in ("hard_v", "hard_d45", "upscale2x"):
+        plain, algo2 = pair(name)
+        assert algo2 <= plain + 1e-6, f"{name}: algo2 {algo2} > plain {plain}"
+    for name in ("isoluminant", "misalign4", "texture"):
+        plain, algo2 = pair(name)
+        assert abs(algo2 - plain) <= 1e-6, (
+            f"{name}: algo2 differs from plain by {algo2 - plain}")
+    for name in ("hardL_softC", "ridge_line", "ramp", "noise"):
+        plain, algo2 = pair(name)
+        assert algo2 <= plain + 0.001, (
+            f"{name}: algo2 regression {algo2 - plain} exceeds 0.001")
+
+
 def main():
     algos = {"plain": dict(strength=0.0), "algo2": dict(strength=0.8, algo=2)}
     if "--all" in sys.argv:
@@ -304,12 +338,14 @@ def main():
 
     cases = build_cases()
     tags = list(algos.keys())
+    case_results = {}
     lines = []
     header = f"{'case':<13}" + "".join(f"{t:>10}" for t in tags)
     lines.append(header)
     lines.append("-" * len(header))
     for name, (Y, U, V, mask, scale) in cases.items():
         res = run_case(name, Y, U, V, mask, algos, scale)
+        case_results[name] = res
         def fmt(v):
             return f"{v:>10.5f}" if v == v else f"{'n/a':>10}"
         lines.append(f"{name:<13}" + "".join(fmt(res[t]) for t in tags))
@@ -333,10 +369,14 @@ def main():
     lines.append(f"int8 constant (64,128,128): {res8}  {'OK' if ok8 else 'FAIL'}")
     report = "\n".join(lines)
     print(report)
-    results_dir = os.path.join(HERE, "results")
-    os.makedirs(results_dir, exist_ok=True)
-    with open(os.path.join(results_dir, "latest.md"), "w") as f:
-        f.write("# LGCR battery results\n\n```\n" + report + "\n```\n")
+    if "--check" in sys.argv:
+        check_gates(case_results, tr, ok8)
+        print("battery gates: OK")
+    if "--write-results" in sys.argv:
+        results_dir = os.path.join(HERE, "results")
+        os.makedirs(results_dir, exist_ok=True)
+        with open(os.path.join(results_dir, "latest.md"), "w") as f:
+            f.write("# LGCR battery results\n\n```\n" + report + "\n```\n")
 
 
 if __name__ == "__main__":

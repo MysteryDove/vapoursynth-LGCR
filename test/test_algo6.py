@@ -121,14 +121,21 @@ def run_gate_regressions():
     assert qdiff > 1e-4, f"qgate parameter appears ineffective: max diff {qdiff}"
     print(f"qgate 0-vs-1 max chroma diff: {qdiff:.7f}")
 
-    plain = core.lgcr.Recon(src, kernel="jinc", taps=3, strength=0,
-                            algo=6).get_frame(0)
-    tiny = core.lgcr.Recon(src, kernel="jinc", taps=3, strength=1e-6,
-                           algo=6).get_frame(0)
-    for p in range(3):
-        assert np.array_equal(np.asarray(plain[p]), np.asarray(tiny[p])), (
-            f"strength=1e-6 changed plane {p}")
-    print("strength 0-vs-1e-6: bit-identical")
+    strengths = (0.0, 1e-6, 0.000999, 0.001, 0.001001, 1.0)
+    strength_frames = [core.lgcr.Recon(
+        src, kernel="jinc", taps=3, strength=value, algo=6,
+        qgate=0, ms=0, sparse=0).get_frame(0)
+        for value in strengths]
+    total_correction = max_chroma_diff(strength_frames[0], strength_frames[-1])
+    threshold_step = max_chroma_diff(strength_frames[2], strength_frames[4])
+    assert threshold_step <= total_correction * 0.01 + 1e-7, (
+        f"algo6 discontinuity around strength=0.001: step={threshold_step}, "
+        f"total={total_correction}")
+    zero_step = max_chroma_diff(strength_frames[0], strength_frames[1])
+    assert zero_step <= total_correction * 2e-6 + 1e-7, (
+        f"algo6 is not continuous at zero: {zero_step}")
+    print(f"strength continuity: threshold step={threshold_step:.2e}, "
+          f"total correction={total_correction:.7f}")
 
     avx = core.lgcr.Recon(src, kernel="jinc", taps=3, strength=0.8,
                           algo=6, qgate=0.6, ms=0.4).get_frame(0)
