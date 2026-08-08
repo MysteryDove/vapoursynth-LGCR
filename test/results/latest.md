@@ -7,13 +7,15 @@ hard_v          0.03630   0.02361
 hard_d45        0.08810   0.07974
 isoluminant     0.03630   0.03630
 misalign4       0.02030   0.02030
+misalign1       0.01558   0.03345
+nullspace       0.03630   0.03630
 hardL_softC     0.00564   0.00592
 ridge_line      0.00181   0.00181
 ramp            0.00505   0.00505
 texture         0.01196   0.01196
 noise           0.03752   0.03758
 upscale2x       0.03860   0.03367
-temporal        0.00000   0.00000   (inter-frame diff in static region; lower=better)
+temporal        0.00017   0.00015   (aligned edge-band error variance; lower=better)
 
 temporal cases (plain / algo2 / trecon):
 t_move1         0.02483   0.01587   0.01598
