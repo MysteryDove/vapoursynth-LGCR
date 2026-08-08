@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "evaluation" / "results"
 PAPER = ROOT / "paper" / "paper.md"
 BIBLIOGRAPHY = ROOT / "paper" / "references.bib"
+CITATION = ROOT / "CITATION.cff"
+WADA_CONFIG = ROOT / "evaluation" / "wada_study_config.json"
 SEED = 20260808
 REPS = 4000
 
@@ -127,11 +129,25 @@ def main() -> None:
     if config.get("primary_lgcr") != "lgcr_algo6":
         failures.append("config: frozen LGCR method is not lgcr_algo6")
 
+    with WADA_CONFIG.open(encoding="utf-8") as handle:
+        wada_config = json.load(handle)
+    if wada_config.get("protocol_version") != 1:
+        failures.append("Wada study config: protocol_version is not 1")
+    if (wada_config.get("seed_start"), wada_config.get("seed_end")) != (4000, 4063):
+        failures.append("Wada study config: expected frozen seeds 4000-4063")
+    if wada_config.get("primary_comparison") != {
+        "method": "wada_ejbf",
+        "reference": "algo6_lanczos4",
+    }:
+        failures.append("Wada study config: primary comparison changed")
+
     development = read_rows("development.csv")
     test = read_rows("test.csv")
     ablation = read_rows("ablation.csv")
     siting = read_rows("siting.csv")
     phase = read_rows("phase_rescue.csv")
+    kernel_holdout = read_rows("kernel_holdout.csv")
+    wada_holdout = read_rows("wada_holdout.csv")
 
     dev_wada = float(np.mean(scene_values(development, "wada_ejbf", "edge_mae")[1]))
     dev_algo6 = float(np.mean(scene_values(development, "lgcr_algo6", "edge_mae")[1]))
@@ -278,6 +294,109 @@ def main() -> None:
         "phase-rescue half phase",
         compact=True,
     )
+
+    kernel_methods = {
+        "plain_jinc3": "Plain Jinc3",
+        "algo6_jinc3": "Algo6 Jinc3",
+        "plain_lanczos4": "Plain Lanczos4",
+        "algo6_lanczos4": "Algo6 Lanczos4",
+    }
+    if len({row["scene"] for row in kernel_holdout}) != 64:
+        failures.append("kernel holdout: expected 64 scenes")
+    if len(kernel_holdout) != 2048:
+        failures.append(f"kernel holdout: expected 2048 rows, found {len(kernel_holdout)}")
+    for method, label in kernel_methods.items():
+        require(
+            paper_table_row(kernel_holdout, method, label),
+            f"kernel holdout table row {method}",
+        )
+    for reference, label in (
+        ("algo6_jinc3", "Lanczos4-minus-Jinc3"),
+        ("plain_lanczos4", "Lanczos4-algo6-minus-plain"),
+    ):
+        mean, low, high, _ = paired_delta(
+            kernel_holdout, "algo6_lanczos4", reference
+        )
+        require(
+            f"{mean:+.6f} [95% CI {low:+.6f}, {high:+.6f}]",
+            label,
+            compact=True,
+        )
+    for degradation in ("box", "triangle", "bicubic", "lanczos"):
+        selected = subset(kernel_holdout, degradation=degradation)
+        mean, _, _, _ = paired_delta(selected, "algo6_lanczos4", "algo6_jinc3")
+        require(f"({mean:+.6f}", f"kernel degradation {degradation}", compact=True)
+
+    wada_methods = {
+        "plain_bilinear": "Plain bilinear",
+        "wada_ejbf": "Wada EJBF",
+        "plain_lanczos4": "Plain Lanczos4",
+        "algo6_lanczos4": "Algo6 Lanczos4",
+        "algo6_jinc3": "Algo6 Jinc3",
+        "wada_plus_lgcr": "Wada + LGCR correction",
+    }
+    if len({row["scene"] for row in wada_holdout}) != 64:
+        failures.append("Wada holdout: expected 64 scenes")
+    if len(wada_holdout) != 3072:
+        failures.append(f"Wada holdout: expected 3072 rows, found {len(wada_holdout)}")
+    for method, label in wada_methods.items():
+        require(
+            paper_table_row(wada_holdout, method, label),
+            f"Wada holdout table row {method}",
+        )
+    for method, reference, label in (
+        ("wada_ejbf", "algo6_lanczos4", "Wada-minus-Lanczos4"),
+        ("wada_ejbf", "plain_bilinear", "Wada-minus-bilinear"),
+        ("wada_ejbf", "algo6_jinc3", "Wada-minus-Jinc3"),
+        ("wada_plus_lgcr", "wada_ejbf", "hybrid-minus-Wada"),
+        ("wada_plus_lgcr", "algo6_lanczos4", "hybrid-minus-Lanczos4"),
+    ):
+        mean, low, high, _ = paired_delta(wada_holdout, method, reference)
+        require(
+            f"{mean:+.6f} [95% CI {low:+.6f}, {high:+.6f}]",
+            label,
+            compact=True,
+        )
+
+    wada_degradation_labels = {
+        "box": "Box",
+        "triangle": "Triangle",
+        "bicubic": "Bicubic",
+        "lanczos": "Lanczos",
+    }
+    for degradation, label in wada_degradation_labels.items():
+        selected = subset(wada_holdout, degradation=degradation)
+        wada = float(np.mean(scene_values(selected, "wada_ejbf", "edge_mae")[1]))
+        lgcr = float(np.mean(scene_values(selected, "algo6_lanczos4", "edge_mae")[1]))
+        mean, low, high, improved = paired_delta(
+            selected, "wada_ejbf", "algo6_lanczos4"
+        )
+        row = (
+            f"| {label} | {wada:.6f} | {lgcr:.6f} | "
+            f"{mean:+.6f} [{low:+.6f}, {high:+.6f}] | "
+            f"{improved * 100:.1f}% |"
+        )
+        require(row, f"Wada degradation row {degradation}")
+
+    for condition in ("coedge", "soft_chroma"):
+        selected = subset(wada_holdout, condition=condition)
+        values = {
+            method: float(np.mean(scene_values(selected, method, "edge_mae")[1]))
+            for method in ("wada_ejbf", "algo6_lanczos4", "wada_plus_lgcr")
+        }
+        for method, value in values.items():
+            require(
+                f"{value:.6f}",
+                f"Wada {condition} value {method}",
+                compact=True,
+            )
+
+    citation = CITATION.read_text(encoding="utf-8")
+    require("MysteryDove", "paper author")
+    if citation.count("name: MysteryDove") != 2:
+        failures.append("CITATION.cff: expected MysteryDove in software and paper authors")
+    if "From 4:2:0 Sampling to Color Bleed" not in citation:
+        failures.append("CITATION.cff: preferred paper citation is missing")
 
     required_caveats = (
         "This draft does not support a claim about prevalence or subjective benefit on released animation.",

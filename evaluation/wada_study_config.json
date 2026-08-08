@@ -1,0 +1,42 @@
+{
+  "bootstrap_repetitions": 4000,
+  "bootstrap_seed": 20260808,
+  "degradations": [
+    "box",
+    "triangle",
+    "bicubic",
+    "lanczos"
+  ],
+  "hybrid": {
+    "correction_ar": -1.0,
+    "correction_kernel": "lanczos",
+    "correction_taps": 4,
+    "hull_radius": 2
+  },
+  "methods": [
+    "plain_bilinear",
+    "wada_ejbf",
+    "plain_lanczos4",
+    "algo6_lanczos4",
+    "algo6_jinc3",
+    "wada_plus_lgcr"
+  ],
+  "primary_comparison": {
+    "method": "wada_ejbf",
+    "reference": "algo6_lanczos4"
+  },
+  "primary_endpoint": "edge_mae",
+  "protocol_version": 1,
+  "seed_end": 4063,
+  "seed_start": 4000,
+  "sitings": [
+    "left",
+    "center"
+  ],
+  "wada_ejbf": {
+    "radius": 12,
+    "sigma_chroma": 0.1,
+    "sigma_luma": 0.03,
+    "sigma_spatial": 4.0
+  }
+}

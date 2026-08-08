@@ -42,7 +42,12 @@ state-of-the-art claim. Real-animation prevalence, codec quantization, and
 subjective benefit remain open evaluation requirements. In a separately frozen
 supplemental holdout, replacing Jinc3 with a development-selected Lanczos4 base
 improves algo6 edge MAE by 0.000945 (95% CI 0.000733 to 0.001161), while
-slightly increasing tangent alias.
+slightly increasing tangent alias. A second repository-frozen supplemental
+holdout finds no conclusive aggregate difference between Wada EJBF and
+Lanczos4-based algo6 (Wada-minus-LGCR -0.000963, 95% CI -0.002209 to
++0.000426), while reproducing their degradation-dependent rank reversal. An
+exploratory additive hybrid reaches 0.019990 edge MAE but worsens soft-chroma
+boundaries, so it is evidence for complementarity rather than a selected method.
 
 Keywords: chroma upsampling, color bleeding, chroma aliasing, animation,
 4:2:0, chroma siting, guided reconstruction, reproducibility
@@ -369,6 +374,22 @@ comparison against Jinc3 was then frozen before evaluating 64 new scenes
 `evaluation/kernel_study_config.json`. This repository-local freeze is not an
 external preregistration and cannot alter the main primary analysis.
 
+After observing that kernel holdout, a second supplemental protocol froze a
+direct Wada-versus-Lanczos4 comparison on 64 further scenes (seeds 4000 through
+4063). Wada retains the published parameters used in the main benchmark. A
+secondary diagnostic composes the two estimators as
+
+$$
+\hat C_H = \operatorname{clip}_{H(C_{420})}
+\left(\hat C_W + \hat C_{L4,\mathrm{algo6}} - \hat C_{L4,\mathrm{plain}}\right),
+$$
+
+where the LGCR difference is extracted with output clamping disabled and the
+composition is then limited to a bilinearly expanded local 5 by 5 chroma hull
+$H$. This hybrid was specified before the new rows were evaluated but remains
+exploratory. The frozen choices are recorded in
+`evaluation/wada_study_protocol.md` and `evaluation/wada_study_config.json`.
+
 ## 3. Results
 
 ### 3.1 Held-out comparison
@@ -527,7 +548,54 @@ and ringing relative to algo6 Jinc3, but raises tangent alias from 0.068443 to
 0.071482. This shows that LGCR is not dependent on Jinc and that base-kernel
 choice remains a metric-dependent tradeoff.
 
-### 3.7 Real-domain validation status
+### 3.7 Supplemental Wada EJBF comparison
+
+A third synthetic split directly compares Wada EJBF with the selected
+Lanczos4-based algo6 configuration. It contains 64 new scenes, four
+degradations, and two matched sitings. Table 7 reports all frozen methods plus
+the prespecified exploratory hybrid.
+
+**Table 7. Frozen supplemental Wada holdout. These rows use different scenes
+from Tables 1 and 6.**
+
+| Method | Edge MAE [95% CI] | Bleed profile | Abs. phase px | Alias px | Spread delta px | Ringing |
+|---|---:|---:|---:|---:|---:|---:|
+| Plain bilinear | 0.030184 [0.026381, 0.033811] | 0.041046 | 0.067279 | 0.093478 | 1.607117 | 0.001996 |
+| Wada EJBF | 0.021767 [0.019257, 0.024131] | 0.032326 | 0.079620 | 0.100553 | 0.753627 | **0.000070** |
+| Plain Lanczos4 | 0.024640 [0.021492, 0.027645] | 0.036244 | **0.065778** | 0.081758 | 1.041220 | 0.005182 |
+| Algo6 Lanczos4 | 0.022730 [0.019850, 0.025472] | 0.033421 | 0.077851 | **0.078539** | 0.848163 | 0.006121 |
+| Algo6 Jinc3 | 0.023713 [0.020704, 0.026569] | 0.033734 | 0.078613 | 0.076516 | 0.865489 | 0.006715 |
+| Wada + LGCR correction | **0.019990 [0.017341, 0.022563]** | **0.029773** | 0.093582 | 0.096819 | **0.552768** | 0.000941 |
+
+The primary Wada-minus-Lanczos4-algo6 edge-MAE difference is -0.000963 [95%
+CI -0.002209, +0.000426], with 65.6% of scenes improved. The interval crosses
+zero, so this split does not establish an aggregate winner. Wada does beat
+Jinc3-based algo6 by -0.001946 [95% CI -0.003252, -0.000527] and its own
+bilinear input surface by -0.008418 [95% CI -0.010614, -0.006132].
+
+**Table 8. Wada EJBF minus Lanczos4-algo6 by actual degradation. Negative
+favors Wada.**
+
+| True degradation | Wada EJBF | Algo6 Lanczos4 | Paired delta [95% CI] | Scenes improved |
+|---|---:|---:|---:|---:|
+| Box | 0.024393 | 0.021811 | +0.002582 [+0.001943, +0.003260] | 12.5% |
+| Triangle | 0.024659 | 0.021092 | +0.003567 [+0.002600, +0.004613] | 12.5% |
+| Bicubic | 0.019422 | 0.023399 | -0.003977 [-0.005747, -0.002055] | 73.4% |
+| Lanczos | 0.018592 | 0.024619 | -0.006027 [-0.008080, -0.003836] | 75.0% |
+
+The same rank reversal seen in the original primary comparison therefore
+survives both a new scene split and the Lanczos4 base change. The exploratory
+hybrid is lower than Wada by -0.001777 [95% CI -0.002606, -0.000965] and lower
+than Lanczos4-algo6 by -0.002740 [95% CI -0.004626, -0.000740]. That aggregate
+gain is concentrated in co-edge scenes (0.015806 versus 0.021695 for Wada and
+0.025885 for Lanczos4-algo6), while the hybrid worsens soft-chroma scenes to
+0.024427 versus 0.021806 for Wada and 0.010140 for Lanczos4-algo6. It also has
+higher phase and tangent-alias errors than Lanczos4-algo6. Only 45.3% of scenes
+improve over Wada, partly because isoluminant and luma-only cases are unchanged.
+The hybrid is therefore
+a mechanism probe, not a method-selection result.
+
+### 3.8 Real-domain validation status
 
 The tracked animation and natural-image manifests are empty. Running
 `make eval-corpora` therefore emits `Status: INCOMPLETE` and no domain
@@ -564,6 +632,14 @@ on new synthetic scenes, especially when the forward degradation has bicubic
 or Lanczos-like support. Jinc3 retains lower tangent alias. This is evidence for
 two useful operating points, not for changing the original primary method
 after the fact.
+
+The direct supplemental Wada comparison strengthens the conditional account.
+Its aggregate difference against Lanczos4-based algo6 is inconclusive, but all
+four degradation-specific intervals exclude zero in opposite directions. The
+exploratory hybrid shows that Wada's smooth chroma self-guidance and LGCR's
+constrained luma residual can be complementary on true co-edges. Its regression
+on soft chroma shows that a credible boundary-type gate is a prerequisite, not
+an optional refinement.
 
 Guide mismatch is equally important. Chroma self-guidance lets EJBF reconstruct
 isoluminant boundaries, while LGCR's luma-first design cannot. Conversely,
@@ -650,6 +726,11 @@ filled, the paper should say "animation-style synthetic content," not
     forward-model family matching rather than a generally better reconstruction
     kernel. Radial, anisotropic, and codec-estimated point-spread functions are
     needed before making a general kernel-ranking claim.
+13. **Sequential Wada and hybrid study.** The direct Wada comparison was
+    designed only after both earlier result sets were observed. Its scenes are
+    new, but they use the same generator. The additive hybrid is not a native
+    EJBF-base implementation, has no optimized plugin path, and visibly harms
+    soft-chroma scenes; its lower aggregate synthetic endpoint is exploratory.
 
 ### 4.5 Beyond Jinc
 
@@ -664,6 +745,14 @@ smoothing. Fourth, an animation-specific inverse model could fit two chroma
 side colors and a monotone boundary profile whose location is guided, but not
 dictated, by luma. That would address bleeding and phase directly rather than
 through a fixed interpolation footprint.
+
+The second supplemental holdout directly tests the EJBF alternative. Wada and
+Lanczos4-based algo6 have no conclusive aggregate ordering, and their ranking
+reverses with the degradation family. Adding LGCR's extracted correction to
+Wada lowers the aggregate edge endpoint, demonstrating complementary signal
+content, but the soft-chroma regression rules out unconditional composition.
+The next useful algorithm is therefore a gated or degradation-conditioned
+combination, not a global replacement of Jinc with EJBF.
 
 The kernel comparison also has a structural confound: all simulated forward
 degradations are separable, as is Lanczos4, while Jinc is radial. Forward-model
@@ -684,8 +773,10 @@ the analytic method.
 The next confirmatory study should freeze a licensed 4:4:4 animation corpus, a
 matched natural-image corpus, codec settings, and a new test split before any
 method selection. It should include Wada EJBF, plain high-quality resampling,
-LGCR, and a degradation-aware selector; report both objective profiles and a
-blinded paired preference study; and cluster inference by work and shot. A
+LGCR, and a degradation-aware selector with a separately learned co-edge versus
+soft-chroma gate; report both objective profiles and a blinded paired preference
+study; and cluster inference by work and shot. Neither the true degradation
+label nor the synthetic condition label may be supplied to that selector. A
 separate frequency/phase sweep should broaden the current axial rescue and
 Nyquist diagnostics. Temporal reconstruction should remain a later extension
 until the single-frame claim is stable.
@@ -700,6 +791,11 @@ incorrect siting nearly doubles phase error. These are useful findings because
 they replace a broad novelty claim with a falsifiable map of when methods work.
 A separate new holdout shows that Lanczos4 is a viable and, for edge MAE,
 stronger algo6 base than Jinc3, while Jinc3 preserves lower tangent alias.
+A further frozen split finds no conclusive aggregate ordering between Wada and
+Lanczos4-based algo6, confirms their degradation-dependent rank reversal, and
+shows that an exploratory additive hybrid improves co-edges while failing on
+soft chroma. This identifies conditional combination as a testable next step,
+not as a validated replacement method.
 
 The controlled study is technically ready for a transparent GitHub working-
 paper release, but the repository still needs explicit licenses and a versioned
