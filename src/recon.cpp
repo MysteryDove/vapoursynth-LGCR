@@ -270,7 +270,7 @@ void reconstructChroma(const ChromaJob &job) {
                 const float dL0 = gm.lc.at(ncx, ncy) - L0;
                 const float sim0 = 1.0f / (1.0f + dL0 * dL0 * invSigma2);
                 const float pg = (1.0f - 2.0f * phx) * (1.0f - 2.0f * phy);
-                rescue = guideFade * pg * pg * (1.0f - sim0); // guideFade carries strength
+                rescue = float(d.rescue) * guideFade * pg * pg * (1.0f - sim0);
                 // Per-kernel-family rescue gating: the "phase 0 = delta"
                 // assumption only holds for separable kernels. jinc(1)=0.18,
                 // so at phase 0 jinc already draws from neighbors and needs
