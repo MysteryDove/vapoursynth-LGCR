@@ -50,7 +50,7 @@ gt = blank.std.ModifyFrame(blank, make_gt)
 # Degrade to 4:2:0 (chroma bleed introduced here), as a decoder would see it
 src420 = gt.resize.Bilinear(format=FMT420)
 
-core.std.LoadPlugin(os.path.join(ROOT, "liblgcr.so"))
+core.std.LoadPlugin(os.environ.get("LGCR_PLUGIN", os.path.join(ROOT, "liblgcr.so")))
 plain = core.lgcr.Recon(src420, kernel="lanczos", taps=3, strength=0.0, ar=-1.0)
 guided = core.lgcr.Recon(src420, kernel="lanczos", taps=3, strength=0.8)
 
@@ -110,7 +110,7 @@ print(f"luma plain-vs-guided max diff: {maxdy:.2e} (should be 0)")
 failed = failed or maxdy != 0.0
 
 # Cross-check scalar build vs AVX2 build
-core.std.LoadPlugin(os.path.join(ROOT, "liblgcr_scalar.so"))
+core.std.LoadPlugin(os.environ.get("LGCR_PLUGIN_SCALAR", os.path.join(ROOT, "liblgcr_scalar.so")))
 scalar = core.lgcr_scalar.Recon(src420, kernel="lanczos", taps=3, strength=0.8)
 fscalar = scalar.get_frame(0)
 maxdc = 0.0
