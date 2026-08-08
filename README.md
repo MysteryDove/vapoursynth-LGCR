@@ -53,13 +53,44 @@ Alternatively, install `liblgcr.so` in a VapourSynth autoload directory. The
 functions are then available as `core.lgcr.Recon`, `core.lgcr.TRecon`, and
 `core.lgcr.Sharpen`.
 
-## Recon
+## Function Reference
+
+### `lgcr.Recon`
+
+```python
+lgcr.Recon(
+    clip,
+    width=None,
+    height=None,
+    kernel="lanczos",
+    taps=3,
+    algo=2,
+    b=0.0,
+    c=0.6,
+    strength=0.8,
+    sigma=0.01,
+    sratio=0.15,
+    sdb=3.0,
+    stretch=1.0,
+    gsigma=2.5,
+    rescue=1.0,
+    ridge=1,
+    cedge=0,
+    ar=0.0,
+    reg=0.005,
+    loc=None,
+    sparse=1,
+    bp=0.0,
+    ms=1.0,
+    qgate=1.0,
+)
+```
 
 `Recon` accepts constant-size planar YUV 4:2:0, 4:2:2, or 4:4:4 input in
 8-16-bit integer or 32-bit float format. It returns planar YUV 4:4:4 with the
 same sample type and bit depth.
 
-### Same-Size 4:2:0 To 4:4:4
+#### Same-Size 4:2:0 To 4:4:4
 
 ```python
 src = core.ffms2.Source("input.mkv")
@@ -69,7 +100,7 @@ out.set_output()
 
 The default is `algo=2` with a three-lobe Lanczos base kernel.
 
-### Resize And Reconstruct
+#### Resize And Reconstruct
 
 ```python
 out = core.lgcr.Recon(
@@ -84,12 +115,13 @@ out = core.lgcr.Recon(
 
 Both luma and chroma are resized. The output remains YUV 4:4:4.
 
-### Select A Reconstruction Mode
+#### Select A Reconstruction Mode
 
 ```python
 guided = core.lgcr.Recon(src, algo=2)
 selector = core.lgcr.Recon(src, algo=4)
-detail_transfer = core.lgcr.Recon(src, algo=6, kernel="jinc", taps=3)
+detail_transfer = core.lgcr.Recon(src, algo=6, kernel="lanczos", taps=4)
+radial_detail_transfer = core.lgcr.Recon(src, algo=6, kernel="jinc", taps=3)
 plain = core.lgcr.Recon(src, strength=0.0)
 ```
 
@@ -98,7 +130,7 @@ plain = core.lgcr.Recon(src, strength=0.0)
 - `algo=6` applies constrained luma-detail transfer to the base reconstruction.
 - `strength=0.0` disables guidance and is useful for A/B comparisons.
 
-### Chroma Siting
+#### Chroma Siting
 
 When `loc` is omitted, `Recon` reads the frame's `_ChromaLocation` property.
 Preserve this property from the source whenever possible because it can encode
@@ -117,7 +149,7 @@ The explicit `loc` override represents vertically centered chroma. For top- or
 bottom-sited material, set the correct `_ChromaLocation` frame property and
 leave `loc` unset.
 
-### Recon Parameters
+#### Recon Parameters
 
 | Parameter | Default | Accepted values / purpose |
 |---|---:|---|
@@ -143,7 +175,63 @@ leave `loc` unset.
 | `cedge` | `0` | Experimental chroma-transition gate toggle |
 | `bp` | `0.0` | Same-size 4:2:0 back-projection gain, `0..1` |
 
-## TRecon
+### `lgcr.Sharpen`
+
+```python
+lgcr.Sharpen(
+    clip,
+    alpha=0.3,
+    sigma=0.01,
+    sratio=0.15,
+    gspatial=1.2,
+    ar=0.0,
+)
+```
+
+`Sharpen` accepts planar YUV input and preserves its dimensions, subsampling,
+sample type, and bit depth.
+
+```python
+reconstructed = core.lgcr.Recon(src)
+out = core.lgcr.Sharpen(reconstructed, alpha=0.3)
+```
+
+It can also be used directly on subsampled YUV:
+
+```python
+out = core.lgcr.Sharpen(src, alpha=0.4, ar=0.0)
+```
+
+#### Sharpen Parameters
+
+| Parameter | Default | Accepted values / purpose |
+|---|---:|---|
+| `alpha` | `0.3` | Sharpening amount |
+| `sigma` | `0.01` | Positive similarity floor |
+| `sratio` | `0.15` | Positive adaptive-similarity ratio |
+| `gspatial` | `1.2` | Positive spatial support width |
+| `ar` | `0.0` | Local sample-hull margin; a negative value disables clamping |
+
+### `lgcr.TRecon`
+
+```python
+lgcr.TRecon(
+    clip,
+    strength=0.8,
+    sigma=0.01,
+    sratio=0.15,
+    sdb=3.0,
+    gsigma=2.5,
+    stretch=1.0,
+    ar=0.0,
+    ridge=1,
+    sparse=0,
+    ms=1.0,
+    trad=1,
+    tsearch=6,
+    tsad=0.02,
+)
+```
 
 `TRecon` performs same-size temporal reconstruction and returns YUV 4:4:4. It
 requires a constant frame size and frame count. The base spatial mode is fixed
@@ -157,7 +245,7 @@ temporal_wide = core.lgcr.TRecon(src, trad=2, tsearch=8)
 Use `Recon` for still images, single-frame clips, or when temporal motion
 matching is not desired.
 
-### TRecon Parameters
+#### TRecon Parameters
 
 | Parameter | Default | Accepted values / purpose |
 |---|---:|---|
@@ -174,32 +262,6 @@ matching is not desired.
 | `ridge` | `1` | Thin-line protection toggle |
 | `sparse` | `0` | Sparse guided-work toggle |
 | `ms` | `1.0` | Mutual-structure gate strength, `0..1` |
-
-## Sharpen
-
-`Sharpen` accepts planar YUV input and preserves its dimensions, subsampling,
-sample type, and bit depth.
-
-```python
-reconstructed = core.lgcr.Recon(src)
-out = core.lgcr.Sharpen(reconstructed, alpha=0.3)
-```
-
-It can also be used directly on subsampled YUV:
-
-```python
-out = core.lgcr.Sharpen(src, alpha=0.4, ar=0.0)
-```
-
-### Sharpen Parameters
-
-| Parameter | Default | Accepted values / purpose |
-|---|---:|---|
-| `alpha` | `0.3` | Sharpening amount |
-| `sigma` | `0.01` | Positive similarity floor |
-| `sratio` | `0.15` | Positive adaptive-similarity ratio |
-| `gspatial` | `1.2` | Positive spatial support width |
-| `ar` | `0.0` | Local sample-hull margin; a negative value disables clamping |
 
 ## Output And Encoding
 
