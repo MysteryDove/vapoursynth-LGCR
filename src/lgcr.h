@@ -124,6 +124,7 @@ struct LGCRData {
     double reg = 0.005;              // algo=4/6 regression regularization (normalized units)
     double stretch = 1.0;            // along-edge support stretch (0 = isotropic)
     double gsigma = 2.5;             // guided-bump width sigma (luma px)
+    double rescue = 1.0;             // phase-zero additive rescue scale [0,1]
     int algo = 2;                    // 2=guided selector, 4=hybrid selector, 6=detail transfer
     bool ridge = true;               // thin-line (ridge) detection (algo 2/4)
     bool cedge = false;              // EXPERIMENTAL: wide-chroma-transition fade (off, see README)

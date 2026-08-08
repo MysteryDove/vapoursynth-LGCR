@@ -1,0 +1,24 @@
+{
+  "bootstrap_repetitions": 4000,
+  "bootstrap_seed": 20260808,
+  "confirmation_degradations": [
+    "box",
+    "triangle",
+    "bicubic",
+    "lanczos"
+  ],
+  "confirmation_seed_end": 3063,
+  "confirmation_seed_start": 3000,
+  "confirmation_sitings": [
+    "left",
+    "center"
+  ],
+  "primary_endpoint": "edge_mae",
+  "protocol_version": 1,
+  "selected_non_jinc": {
+    "development_edge_mae": 0.023005181565140195,
+    "kernel": "lanczos",
+    "name": "lanczos4",
+    "taps": 4
+  }
+}

@@ -709,6 +709,7 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
     if (err) d->sdb = 3.0;
     d->stretch = vsapi->mapGetFloatSaturated(in, "stretch", 0, &err); if (err) d->stretch = 1.0;
     d->gsigma = vsapi->mapGetFloatSaturated(in, "gsigma", 0, &err); if (err) d->gsigma = 2.5;
+    d->rescue = vsapi->mapGetFloatSaturated(in, "rescue", 0, &err); if (err) d->rescue = 1.0;
     {
         const int64_t ridgeInt = vsapi->mapGetIntSaturated(in, "ridge", 0, &err);
         d->ridge = err ? true : (ridgeInt != 0);
@@ -746,8 +747,8 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
     if (d->strength < 0.0 || d->strength > 1.0 || d->sigma <= 0.0 || d->sratio <= 0.0 ||
         d->sdb <= 0.0 || d->stretch < 0.0 || d->gsigma <= 0.0 || d->reg <= 0.0 ||
         d->bp < 0.0 || d->bp > 1.0 || d->ms < 0.0 || d->ms > 1.0 ||
-        d->qgate < 0.0 || d->qgate > 1.0) {
-        fail("LGCR: invalid parameter range (need 0<=strength<=1, 0<=bp/ms/qgate<=1, "
+        d->qgate < 0.0 || d->qgate > 1.0 || d->rescue < 0.0 || d->rescue > 1.0) {
+        fail("LGCR: invalid parameter range (need 0<=strength/rescue<=1, 0<=bp/ms/qgate<=1, "
              "sigma/sratio/sdb/gsigma/reg>0, stretch>=0)");
         return;
     }
@@ -777,7 +778,7 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
         "Recon",
         "clip:vnode;width:int:opt;height:int:opt;kernel:data:opt;taps:int:opt;algo:int:opt;"
         "b:float:opt;c:float:opt;strength:float:opt;sigma:float:opt;sratio:float:opt;"
-        "sdb:float:opt;stretch:float:opt;gsigma:float:opt;ridge:int:opt;cedge:int:opt;ar:float:opt;reg:float:opt;loc:data:opt;sparse:int:opt;bp:float:opt;ms:float:opt;qgate:float:opt",
+        "sdb:float:opt;stretch:float:opt;gsigma:float:opt;rescue:float:opt;ridge:int:opt;cedge:int:opt;ar:float:opt;reg:float:opt;loc:data:opt;sparse:int:opt;bp:float:opt;ms:float:opt;qgate:float:opt",
         "clip:vnode", lgcrCreate, nullptr, plugin);
     vspapi->registerFunction(
         "Sharpen",

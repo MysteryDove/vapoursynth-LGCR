@@ -20,7 +20,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install VapourSynth runtime and test dependencies
-        run: python -m pip install "VapourSynth==79" numpy
+        run: python -m pip install "VapourSynth==79" numpy pillow
 
       - name: Run correctness gates
         run: |

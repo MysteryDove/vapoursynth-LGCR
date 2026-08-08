@@ -9,3 +9,6 @@ __pycache__/
 # Editor / OS
 *~
 .DS_Store
+
+# Locally acquired evaluation media (manifests stay tracked)
+evaluation/corpora/data/

@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use this software or benchmark, please cite the working paper."
+title: "LGCR: Luma-Guided Chroma Reconstruction"
+type: software
+authors:
+  - name: MysteryDove
+repository-code: "https://github.com/MysteryDove/vapoursynth-LGCR"
+url: "https://github.com/MysteryDove/vapoursynth-LGCR"
+preferred-citation:
+  type: article
+  title: "From 4:2:0 Sampling to Color Bleed: A Controlled Study of Chroma Boundary Reconstruction for Animation-Style Content"
+  authors:
+    - name: MysteryDove
+  year: 2026
+  url: "https://github.com/MysteryDove/vapoursynth-LGCR/blob/main/paper/paper.md"

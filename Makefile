@@ -33,6 +33,39 @@ check: $(TARGET) liblgcr_scalar.so
 	$(PYTHON) test/test_algo6.py
 	$(PYTHON) test/test_regressions.py
 	$(PYTHON) test/battery.py --all --check
+	$(PYTHON) -m evaluation.test_protocol
+	$(PYTHON) -m evaluation.check_paper
+
+paper-check:
+	$(PYTHON) -m evaluation.check_paper
+
+eval-dev: $(TARGET)
+	$(PYTHON) -m evaluation.run --tune --write-results
+
+eval-test: $(TARGET)
+	$(PYTHON) -m evaluation.run --split test --write-results
+
+eval-ablation: $(TARGET)
+	$(PYTHON) -m evaluation.run --split test --ablation --write-results
+
+eval-siting: $(TARGET)
+	$(PYTHON) -m evaluation.run --split test --siting-mismatch --write-results
+
+eval-phase: $(TARGET)
+	$(PYTHON) -m evaluation.phase_rescue --write-results
+
+eval-kernels: $(TARGET)
+	$(PYTHON) -m evaluation.kernel_study --write-results
+
+eval-kernel-confirm: $(TARGET)
+	$(PYTHON) -m evaluation.kernel_confirm --write-results
+
+eval-kernel-study: eval-kernels eval-kernel-confirm
+
+eval-corpora:
+	$(PYTHON) -m evaluation.coedge --write-results
+
+eval-results: eval-dev eval-test eval-ablation eval-siting eval-phase
 
 asan-check: liblgcr_asan.so
 	ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 \
@@ -41,4 +74,4 @@ asan-check: liblgcr_asan.so
 clean:
 	rm -f $(TARGET) liblgcr_scalar.so liblgcr_asan.so src/*.o
 
-.PHONY: all check asan-check clean
+.PHONY: all check paper-check asan-check eval-dev eval-test eval-ablation eval-siting eval-phase eval-kernels eval-kernel-confirm eval-kernel-study eval-corpora eval-results clean

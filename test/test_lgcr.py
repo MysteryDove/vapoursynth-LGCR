@@ -53,10 +53,13 @@ src420 = gt.resize.Bilinear(format=FMT420)
 core.std.LoadPlugin(os.environ.get("LGCR_PLUGIN", os.path.join(ROOT, "liblgcr.so")))
 plain = core.lgcr.Recon(src420, kernel="lanczos", taps=3, strength=0.0, ar=-1.0)
 guided = core.lgcr.Recon(src420, kernel="lanczos", taps=3, strength=0.8)
+guided_explicit_rescue = core.lgcr.Recon(
+    src420, kernel="lanczos", taps=3, strength=0.8, rescue=1.0)
 
 fgt = gt.get_frame(0)
 fplain = plain.get_frame(0)
 fguided = guided.get_frame(0)
+fexplicit = guided_explicit_rescue.get_frame(0)
 
 assert fplain.width == W and fplain.height == H, "output size mismatch"
 assert fplain.format.subsampling_w == 0 and fplain.format.subsampling_h == 0, "output must be 444"
@@ -108,6 +111,15 @@ yp, yg = fplain[0], fguided[0]
 maxdy = max(abs(yp[j, i] - yg[j, i]) for j in range(H) for i in range(W))
 print(f"luma plain-vs-guided max diff: {maxdy:.2e} (should be 0)")
 failed = failed or maxdy != 0.0
+
+# The paper-only rescue ablation must be opt-in behaviorally: adding the new
+# parameter with its default value cannot alter the established output.
+max_rescue_default_diff = max(
+    abs(fguided[p][j, i] - fexplicit[p][j, i])
+    for p in (1, 2) for j in range(H) for i in range(W)
+)
+print(f"rescue default-vs-explicit max diff: {max_rescue_default_diff:.2e}")
+failed = failed or max_rescue_default_diff != 0.0
 
 # Cross-check scalar build vs AVX2 build
 core.std.LoadPlugin(os.environ.get("LGCR_PLUGIN_SCALAR", os.path.join(ROOT, "liblgcr_scalar.so")))

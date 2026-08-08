@@ -1,0 +1,35 @@
+{
+  "development_seeds": [
+    100,
+    111
+  ],
+  "galosh_form": {
+    "anti_ringing": true,
+    "sigma_range": 0.015
+  },
+  "guided_filter": {
+    "eps": 0.0001,
+    "radius": 1
+  },
+  "held_out_seeds": [
+    1000,
+    1031
+  ],
+  "jbu": {
+    "radius": 2,
+    "sigma_range": 0.015,
+    "sigma_spatial": 1.5
+  },
+  "korhonen": {
+    "theta": 0.15
+  },
+  "primary_external": "wada_ejbf",
+  "primary_lgcr": "lgcr_algo6",
+  "protocol_version": 2,
+  "wada_ejbf": {
+    "radius": 12,
+    "sigma_chroma": 0.1,
+    "sigma_luma": 0.03,
+    "sigma_spatial": 4.0
+  }
+}
