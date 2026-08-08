@@ -138,4 +138,95 @@ Plane buildLcMap(const Plane &lcY, int cw, int ch, double rw, double rh,
     return lc;
 }
 
+// ---------------------------------------------------------------------------
+// Mutual-structure co-edge gate (review item 5)
+//
+// The luma guide may only transfer high-frequency detail into chroma where
+// the chroma planes CONFIRM a co-located edge. Both sides' gradient-magnitude
+// profiles are measured along the luma edge normal over +/-3 chroma px, and
+// compared in shape:
+//
+//   width:  participation ratio p = (sum g)^2 / sum(g^2)  (~number of taps
+//           the edge is spread over). Chroma much WIDER than luma (soft
+//           blend under a hard luma edge, the hardL_softC failure) must not
+//           receive luma high frequencies. The other direction (chroma
+//           sharper than luma) is harmless and passes.
+//   phase:  |centroid(gY) - centroid(gC)| in chroma px. A chroma edge
+//           shifted from the luma edge (encoder misalignment) is not
+//           co-located; transferring would invent an edge at the wrong place.
+//
+// The luma side uses the lc map (footprint box = the candidate 420 encoder
+// filter), so the comparison happens at the resolution where chroma
+// information actually exists. Measured separation on the battery:
+// hard_v/d45/ramp ratio=1.00 dcent=0; hardL_softC ratio=1.8; misalign4
+// dcent=2.0.
+Plane buildMutualGate(const Plane &lc, const Plane &U, const Plane &V, double sigma) {
+    (void)sigma; // reserved for a future noise-adaptive profile floor
+    const int w = lc.w, h = lc.h;
+    Plane gx(w, h), gy(w, h), ux(w, h), uy(w, h), vx(w, h), vy(w, h);
+    auto sobel = [](const Plane &p, Plane &ox, Plane &oy) {
+        for (int j = 0; j < p.h; ++j)
+            for (int i = 0; i < p.w; ++i) {
+                const float tl = p.at(i - 1, j - 1), t = p.at(i, j - 1), tr = p.at(i + 1, j - 1);
+                const float l = p.at(i - 1, j), r = p.at(i + 1, j);
+                const float bl = p.at(i - 1, j + 1), b = p.at(i, j + 1), br = p.at(i + 1, j + 1);
+                ox.at(i, j) = (tr + 2 * r + br - tl - 2 * l - bl) * 0.125f;
+                oy.at(i, j) = (bl + 2 * b + br - tl - 2 * t - tr) * 0.125f;
+            }
+    };
+    sobel(lc, gx, gy);
+    sobel(U, ux, uy);
+    sobel(V, vx, vy);
+
+    Plane gate(w, h);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            // luma edge normal from the 3x3-smoothed structure tensor
+            float sxx = 0, sxy = 0, syy = 0;
+            for (int dj = -1; dj <= 1; ++dj)
+                for (int di = -1; di <= 1; ++di) {
+                    const float a = gx.at(x + di, y + dj);
+                    const float b = gy.at(x + di, y + dj);
+                    sxx += a * a;
+                    sxy += a * b;
+                    syy += b * b;
+                }
+            const float jdiff = sxx - syy, jsum = sxx + syy;
+            if (jsum < 1e-10f) {
+                gate.at(x, y) = 0.0f;
+                continue;
+            }
+            const float theta = 0.5f * std::atan2(2.0f * sxy, jdiff);
+            const float nx = std::cos(theta), ny = std::sin(theta);
+
+            float sumY = 0, sqY = 0, momY = 0;
+            float sumC = 0, sqC = 0, momC = 0;
+            for (int k = -3; k <= 3; ++k) {
+                const double px = x + k * nx, py = y + k * ny;
+                const float gY = std::fabs(bilinear(gx, px, py) * nx + bilinear(gy, px, py) * ny);
+                const float au = bilinear(ux, px, py) * nx + bilinear(uy, px, py) * ny;
+                const float av = bilinear(vx, px, py) * nx + bilinear(vy, px, py) * ny;
+                const float gC = std::sqrt(au * au + av * av);
+                sumY += gY; sqY += gY * gY; momY += k * gY;
+                sumC += gC; sqC += gC * gC; momC += k * gC;
+            }
+            // (No absolute energy gates: on flat luma the guide is inert
+            // anyway, and on flat chroma every weighting gives the same
+            // average — an energy floor can only CAP legitimate weak edges.)
+            if (sumY < 1e-9f || sumC < 1e-9f) {
+                gate.at(x, y) = 0.0f;
+                continue;
+            }
+            const float partY = sumY * sumY / (sqY + 1e-12f);
+            const float partC = sumC * sumC / (sqC + 1e-12f);
+            const float ratio = partC / (partY + 1e-6f);
+            const float dcent = std::fabs(momY / sumY - momC / sumC);
+            const float tw = std::clamp((1.6f - ratio) / 0.4f, 0.0f, 1.0f);
+            const float tp = std::clamp((1.0f - dcent) / 0.5f, 0.0f, 1.0f);
+            gate.at(x, y) = (tw * tw * (3.0f - 2.0f * tw)) * (tp * tp * (3.0f - 2.0f * tp));
+        }
+    }
+    return gate;
+}
+
 } // namespace lgcr

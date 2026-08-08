@@ -127,6 +127,7 @@ struct LGCRData {
     int algo = 2;                    // 1 = v1.2, 2 = v1.3, 3 = LGF, 4 = selector, 5 = NEDI
     bool ridge = true;               // thin-line (ridge) detection (algo 2/4)
     bool cedge = false;              // EXPERIMENTAL: wide-chroma-transition fade (off, see README)
+    double ms = 1.0;                 // mutual-structure co-edge gate strength (algo 2/4, TRecon)
     bool sparse = true;              // sparse correction: guide only near luma structure
     bool locSet = false;             // loc param explicitly given (else read _ChromaLocation)
     double bp = 0.0;                 // back-projection data-consistency gain (420 same-size)
@@ -201,10 +202,16 @@ struct GuideMaps {
     Plane jyy;  //   coherence come from the eigensystem, not raw gradients.
     Plane db;   // full-res median |4-neighbor luma diff| (algo=1 slope floor)
     Plane lc;   // chroma-res luma level of each chroma sample (footprint average)
+    Plane ms;   // chroma-res mutual-structure co-edge gate [0,1] (empty if off)
 };
 
 GuideMaps buildGuideMaps(const Plane &structY, const Plane &lcY, int cw, int ch,
                          double rw, double rh, double shiftX, double shiftY, bool needDb);
+
+// Mutual-structure co-edge gate at chroma res (maps.cpp). rho-correlation of
+// luma/chroma gradient profiles along the luma edge normal; 1 = confirmed
+// co-edge (direction + position + width agree), 0 = no chroma-side evidence.
+Plane buildMutualGate(const Plane &lc, const Plane &U, const Plane &V, double sigma);
 
 // Footprint-averaged luma at each chroma sample (standalone, for TRecon).
 Plane buildLcMap(const Plane &lcY, int cw, int ch, double rw, double rh,

@@ -25,6 +25,11 @@ void reconstructChroma(const ChromaJob &job) {
     const Plane &oY = *job.srcY;
     const BilinAxis bx = guided ? buildBilinAxis(ax.lpos, oY.w) : BilinAxis();
     const BilinAxis by = guided ? buildBilinAxis(ay.lpos, oY.h) : BilinAxis();
+    // Mutual-structure gate map lives at CHROMA res: sample at (scx, scy).
+    const bool useMs = guided && d.ms > 0.0 && gm.ms.w > 0;
+    const BilinAxis mbx = useMs ? buildBilinAxis(ax.pos, gm.ms.w) : BilinAxis();
+    const BilinAxis mby = useMs ? buildBilinAxis(ay.pos, gm.ms.h) : BilinAxis();
+    const float msStrength = float(d.ms);
     // probe distance: one chroma tap spacing, in source luma px
     const float spOut = float(std::max(job.rw, job.rh));
 
@@ -39,7 +44,7 @@ void reconstructChroma(const ChromaJob &job) {
     const bool clampHull = d.arMargin >= 0.0;
     const float margin = float(std::max(0.0, d.arMargin));
     // SIMD path requires the full padded window to be inside the plane
-    const bool simdOK = U.w >= ax.sup;
+    [[maybe_unused]] const bool simdOK = U.w >= ax.sup;
 
     for (int oy = 0; oy < outU.h; ++oy) {
         const int ty0 = ay.start[oy];
@@ -250,9 +255,21 @@ void reconstructChroma(const ChromaJob &job) {
                     cedgeFade = std::clamp((2.2f - wc) / 0.7f, 0.0f, 1.0f);
                 }
             }
+            // Mutual-structure co-edge fade: the chroma planes must confirm
+            // an edge co-located (direction/position/width) with the luma
+            // edge, otherwise luma high-frequency transfer is gated off and
+            // the plain kernel's (truthful) softness is kept. This is what
+            // fixes the hardL_softC residual: a soft chroma blend under a
+            // hard luma edge fails the profile-correlation test.
+            float msFade = 1.0f;
+            if (useMs) {
+                const float g = bilinearFast(gm.ms, mbx.i0[ox], mbx.f[ox],
+                                             mby.i0[oy], mby.f[oy]);
+                msFade = 1.0f - msStrength * (1.0f - g);
+            }
             // strength scales the sim discrimination itself: lambda -> 0
             // must degrade continuously to the plain kernel
-            const float guideFade = ridgeFade * cedgeFade * strength;
+            const float guideFade = ridgeFade * cedgeFade * msFade * strength;
 
             // Phase-0 rescue: at subpixel phase ~0 the base kernel is a delta
             // and returns the coincident source sample unchanged. That sample

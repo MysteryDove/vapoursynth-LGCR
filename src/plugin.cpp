@@ -198,8 +198,11 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     // Guide maps from the SOURCE luma (see recon.cpp for why output-space
     // was tried and rejected); Lc footprint also from the source plane.
     GuideMaps gm;
-    if (d->strength > 0.0)
+    if (d->strength > 0.0) {
         gm = buildGuideMaps(y, y, cw, ch, rw, rh, d->shiftX, d->shiftY, d->algo == 1);
+        if (d->ms > 0.0 && (d->algo == 2 || d->algo == 4))
+            gm.ms = buildMutualGate(gm.lc, cb, cr, d->sigma);
+    }
 
     // Chroma: guided reconstruction (output 444 grid == output luma grid).
     // Both planes are processed in one pass — guide weights depend only on
@@ -427,8 +430,11 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
 
     // Y: same size -> verbatim copy
     GuideMaps gm;
-    if (d->strength > 0.0)
+    if (d->strength > 0.0) {
         gm = buildGuideMaps(y, y, cw, ch, rw, rh, d->shiftX, d->shiftY, false);
+        if (d->ms > 0.0)
+            gm.ms = buildMutualGate(gm.lc, cb, cr, d->sigma);
+    }
     {
         if (isFloat)
             floatToPlane<float>(y, vsapi->getWritePtr(dst, 0), vsapi->getStride(dst, 0), sw, sh, 1.0, 0.0, -1e30f, 1e30f);
@@ -509,11 +515,12 @@ static void VS_CC tReconCreate(const VSMap *in, VSMap *out, void *, VSCore *core
     d->gsigma = vsapi->mapGetFloatSaturated(in, "gsigma", 0, &err); if (err) d->gsigma = 2.5;
     d->stretch = vsapi->mapGetFloatSaturated(in, "stretch", 0, &err); if (err) d->stretch = 1.0;
     d->arMargin = vsapi->mapGetFloatSaturated(in, "ar", 0, &err); if (err) d->arMargin = 0.0;
+    d->ms = vsapi->mapGetFloatSaturated(in, "ms", 0, &err); if (err) d->ms = 1.0;
     d->trad = vsapi->mapGetIntSaturated(in, "trad", 0, &err); if (err) d->trad = 1;
     d->tsearch = vsapi->mapGetIntSaturated(in, "tsearch", 0, &err); if (err) d->tsearch = 6;
     d->tsad = vsapi->mapGetFloatSaturated(in, "tsad", 0, &err); if (err) d->tsad = 0.02;
     if (d->strength < 0.0 || d->strength > 1.0 || d->sigma <= 0.0 || d->sratio <= 0.0 ||
-        d->sdb <= 0.0 || d->stretch < 0.0 || d->gsigma <= 0.0 ||
+        d->sdb <= 0.0 || d->stretch < 0.0 || d->gsigma <= 0.0 || d->ms < 0.0 || d->ms > 1.0 ||
         d->trad < 0 || d->trad > 8 || d->tsearch < 0 || d->tsearch > 64 || d->tsad <= 0.0) {
         vsapi->mapSetError(out, "TRecon: invalid parameter range (need 0<=strength<=1, "
                                 "sigma/sratio/sdb/gsigma/tsad>0, stretch>=0, 0<=trad<=8, 0<=tsearch<=64)");
@@ -654,6 +661,7 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
         const int64_t ce = vsapi->mapGetIntSaturated(in, "cedge", 0, &err);
         d->cedge = err ? false : (ce != 0);
     }
+    d->ms = vsapi->mapGetFloatSaturated(in, "ms", 0, &err); if (err) d->ms = 1.0;
     d->arMargin = vsapi->mapGetFloatSaturated(in, "ar", 0, &err); if (err) d->arMargin = 0.0;
     d->reg = vsapi->mapGetFloatSaturated(in, "reg", 0, &err); if (err) d->reg = 0.005;
 
@@ -680,9 +688,9 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
 
     if (d->strength < 0.0 || d->strength > 1.0 || d->sigma <= 0.0 || d->sratio <= 0.0 ||
         d->sdb <= 0.0 || d->stretch < 0.0 || d->gsigma <= 0.0 || d->reg <= 0.0 ||
-        d->bp < 0.0 || d->bp > 1.0 ||
+        d->bp < 0.0 || d->bp > 1.0 || d->ms < 0.0 || d->ms > 1.0 ||
         ((d->kernel == Kernel::Lanczos || d->kernel == Kernel::Jinc) && d->kp1 < 1.0)) {
-        fail("LGCR: invalid parameter range (need 0<=strength<=1, 0<=bp<=1, "
+        fail("LGCR: invalid parameter range (need 0<=strength<=1, 0<=bp<=1, 0<=ms<=1, "
              "sigma/sratio/sdb/gsigma/reg>0, stretch>=0, taps>=1)");
         return;
     }
@@ -712,7 +720,7 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
         "Recon",
         "clip:vnode;width:int:opt;height:int:opt;kernel:data:opt;taps:int:opt;algo:int:opt;"
         "b:float:opt;c:float:opt;strength:float:opt;sigma:float:opt;sratio:float:opt;"
-        "sdb:float:opt;stretch:float:opt;gsigma:float:opt;ridge:int:opt;cedge:int:opt;ar:float:opt;reg:float:opt;loc:data:opt;sparse:int:opt;bp:float:opt",
+        "sdb:float:opt;stretch:float:opt;gsigma:float:opt;ridge:int:opt;cedge:int:opt;ar:float:opt;reg:float:opt;loc:data:opt;sparse:int:opt;bp:float:opt;ms:float:opt",
         "clip:vnode", lgcrCreate, nullptr, plugin);
     vspapi->registerFunction(
         "Sharpen",
@@ -722,7 +730,7 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     vspapi->registerFunction(
         "TRecon",
         "clip:vnode;strength:float:opt;sigma:float:opt;sratio:float:opt;sdb:float:opt;"
-        "gsigma:float:opt;stretch:float:opt;ar:float:opt;ridge:int:opt;sparse:int:opt;"
+        "gsigma:float:opt;stretch:float:opt;ar:float:opt;ridge:int:opt;sparse:int:opt;ms:float:opt;"
         "trad:int:opt;tsearch:int:opt;tsad:float:opt",
         "clip:vnode", tReconCreate, nullptr, plugin);
 }
