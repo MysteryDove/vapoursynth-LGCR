@@ -1,0 +1,51 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  VS_TAG: R79
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch VapourSynth headers
+        run: git clone --depth 1 --branch "$VS_TAG" https://github.com/vapoursynth/vapoursynth.git "$RUNNER_TEMP/vs"
+
+      - name: Build liblgcr.so (AVX2)
+        run: make VSINCLUDE="$RUNNER_TEMP/vs/include" -j"$(nproc)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lgcr-linux-x86_64
+          path: liblgcr.so
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Fetch VapourSynth headers
+        shell: cmd
+        run: git clone --depth 1 --branch %VS_TAG% https://github.com/vapoursynth/vapoursynth.git %RUNNER_TEMP%\vs
+
+      - name: Build lgcr.dll (AVX2)
+        shell: cmd
+        run: >
+          cl /nologo /O2 /std:c++17 /arch:AVX2 /EHsc /D_USE_MATH_DEFINES
+          /I%RUNNER_TEMP%\vs\include /LD
+          src\maps.cpp src\kernels.cpp src\recon.cpp src\algos.cpp src\plugin.cpp
+          /Fe:lgcr.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lgcr-windows-x86_64
+          path: lgcr.dll
