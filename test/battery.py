@@ -67,6 +67,9 @@ def run_case(name, Yf, Uf, Vf, mask, algos, scale=1.0):
         mask = np.kron(mask, np.ones((2, 2))) > 0  # 2x nearest expansion of mask
     res = {}
     for tag, kw in algos.items():
+        if scale != 1.0 and kw.get("algo") == 5:
+            res[tag] = float("nan")  # algo5 is same-size only; plugin rejects scaling
+            continue
         out = core.lgcr.Recon(src420, width=ow, height=oh, kernel="jinc", taps=3, **kw).get_frame(0)
         res[tag] = (mae_band(out, fgt, 1, mask) + mae_band(out, fgt, 2, mask)) / 2
     return res
@@ -177,7 +180,8 @@ def run_temporal(algos):
 
 
 def run_trecon_cases():
-    """TRecon: moving edge (phase diversity) and static noise (averaging)."""
+    """TRecon: odd-pel motion (true phase diversity), even-pel motion (same
+    phase -> must NOT gain), static noise (averaging), single-frame isolation."""
     yy, xx = np.mgrid[0:H, 0:W]
 
     def edge_planes(xedg, noise=0.0, seed=0):
@@ -194,7 +198,9 @@ def run_trecon_cases():
     band = (np.abs(xx - 64) <= 4) & (yy > 4) & (yy < H - 4)
     out = {}
     for label, frames in (
+        ("t_move1", [edge_planes(63), edge_planes(64), edge_planes(65)]),
         ("t_move2", [edge_planes(62), edge_planes(64), edge_planes(66)]),
+        ("t_move3", [edge_planes(61), edge_planes(64), edge_planes(67)]),
         ("t_static_noise", [edge_planes(64, noise=0.01, seed=s) for s in (1, 2, 3)]),
     ):
         gt = make_clip([f[0] for f in frames], [f[1] for f in frames],
@@ -210,7 +216,52 @@ def run_trecon_cases():
                                             np.asarray(fgt[p]).astype(np.float64))[band].mean()
                                       for p in (1, 2)]))
         out[label] = row
+
+    # Isolation: a single-frame clip has NO temporal information; TRecon must
+    # reduce to Recon (boundary frames clamped to n are skipped, not used as
+    # duplicate taps). Reports max abs chroma difference between the two.
+    Y, U, V = edge_planes(64)
+    gt = make_clip([Y], [U], [V], length=1)
+    src420 = degrade(gt)
+    fr = core.lgcr.Recon(src420, strength=0.8, algo=2).get_frame(0)
+    ft = core.lgcr.TRecon(src420, strength=0.8, trad=1).get_frame(0)
+    out["t_single"] = {"isolation_maxdiff": float(max(
+        np.abs(np.asarray(fr[p]) - np.asarray(ft[p])).max() for p in (1, 2)))}
+
+    # Flat-luma ME ambiguity: three IDENTICAL frames, isoluminant chroma
+    # texture. Motion is unobservable; TRecon must not drag texture around.
+    Y = np.full((H, W), 0.5, np.float32)
+    U = (0.15 * np.sin(xx * 0.9) * np.sin(yy * 0.7)).astype(np.float32)
+    V = (0.10 * np.cos(xx * 0.5)).astype(np.float32)
+    gt = make_clip([Y] * 3, [U] * 3, [V] * 3, length=3)
+    src420 = degrade(gt)
+    fgt = gt.get_frame(1)
+    row = {}
+    for tag, node in (("algo2", core.lgcr.Recon(src420, strength=0.8, algo=2, sparse=0)),
+                      ("trecon", core.lgcr.TRecon(src420, strength=0.8, trad=1))):
+        f = node.get_frame(1)
+        row[tag] = float(np.mean([np.abs(np.asarray(f[p]).astype(np.float64) -
+                                        np.asarray(fgt[p]).astype(np.float64)).mean()
+                                  for p in (1, 2)]))
+    out["t_flat_amb"] = row
     return out
+
+
+def run_int8_case():
+    """Integer path: constant YUV420P8 (Y,U,V)=(64,128,128) must round-trip
+    through Recon and TRecon without blowing up (regression: TRecon once
+    normalized int input by 2^bits-1 instead of its reciprocal -> all 255)."""
+    F420_8 = core.query_video_format(vs.YUV, vs.INTEGER, 8, 1, 1)
+    blank = core.std.BlankClip(width=64, height=64, format=F420_8, length=3,
+                               color=[64, 128, 128])
+    res = {}
+    for tag, node in (("recon8", core.lgcr.Recon(blank)),
+                      ("trecon8", core.lgcr.TRecon(blank))):
+        f = node.get_frame(1)
+        res[tag] = [int(np.asarray(f[p][32, 32])) for p in range(3)]
+    ok = all(abs(v - t) <= 1 for vals in res.values()
+             for v, t in zip(vals, (64, 128, 128)))
+    return res, ok
 
 
 def main():
@@ -227,7 +278,9 @@ def main():
     lines.append("-" * len(header))
     for name, (Y, U, V, mask, scale) in cases.items():
         res = run_case(name, Y, U, V, mask, algos, scale)
-        lines.append(f"{name:<13}" + "".join(f"{res[t]:>10.5f}" for t in tags))
+        def fmt(v):
+            return f"{v:>10.5f}" if v == v else f"{'n/a':>10}"
+        lines.append(f"{name:<13}" + "".join(fmt(res[t]) for t in tags))
     res = run_temporal(algos)
     lines.append(f"{'temporal':<13}" + "".join(f"{res[t]:>10.5f}" for t in tags)
                  + "   (inter-frame diff in static region; lower=better)")
@@ -235,7 +288,17 @@ def main():
     lines.append("")
     lines.append("temporal cases (plain / algo2 / trecon):")
     for label, row in tr.items():
-        lines.append(f"{label:<13}" + "".join(f"{row[t]:>10.5f}" for t in ("plain", "algo2", "trecon")))
+        if label == "t_single":
+            lines.append(f"{label:<13} isolation maxdiff = {row['isolation_maxdiff']:.6f}"
+                         "  (must be ~0: single frame has no temporal information)")
+        elif label == "t_flat_amb":
+            lines.append(f"{label:<13}" + "".join(f"{row[t]:>10.5f}" for t in ("algo2", "trecon"))
+                         + "   (identical frames, unobservable motion: trecon ~= algo2 required)")
+        else:
+            lines.append(f"{label:<13}" + "".join(f"{row[t]:>10.5f}" for t in ("plain", "algo2", "trecon")))
+    res8, ok8 = run_int8_case()
+    lines.append("")
+    lines.append(f"int8 constant (64,128,128): {res8}  {'OK' if ok8 else 'FAIL'}")
     report = "\n".join(lines)
     print(report)
     import os
