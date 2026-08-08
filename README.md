@@ -4,15 +4,16 @@
 解决 YUV 子像素彩边（紫边/绿边/色度锯齿）问题。CPU 实现，AVX2 FMA 快速路径，
 全部引导项为有理函数（无 exp/div），对 AVX-512 友好。
 
-当前形态（v1.8）：
+当前形态（v1.9）：
 
 ```
-W'uv = Sim(ΔL) · ( W_kernel + rescue(φ) · Bump_aniso(θ) )
+W'uv = Sim(ΔL) · ( W_kernel + rescue(φ) · Bump_aniso(θ) )     # algo 1/2/4
+C1   = C0 + g · a · lp_t(Y − P(D̂(Y)))                          # algo 6（细节迁移）
 ```
 
 - 基核可选 bilinear / bicubic / lanczos / spline16 / spline36 / **jinc**（全 2D 径向路径）
 - 边缘方向 θ 与各向异性来自**亮度结构张量**（非裸 Sobel）
-- 5 种重建算法入口（`algo=1..5`）+ 独立的边缘感知锐化函数 `lgcr.Sharpen`
+- 6 种重建算法入口（`algo=1..6`）+ 独立的边缘感知锐化函数 `lgcr.Sharpen`
   + 时域重建函数 `lgcr.TRecon`（运动补偿多帧相位分集）
 - v1.6 语义修正：连续 strength、逻辑 tap 掩码、signed wsum 防护、按核族的
   rescue 门控、H.273 `_ChromaLocation` 支持、稀疏引导、可选 back-projection
@@ -20,6 +21,9 @@ W'uv = Sim(ΔL) · ( W_kernel + rescue(φ) · Bump_aniso(θ) )
   残差与 misalign4 语义）；TRecon 阻断级修正（整数归一化反转、参数崩溃、
   相位奇偶反转、边界帧伪收益、平坦块 ME 歧义）；plain 与引导统一代码路径
   （strength 精确连续）；algo3/4 缩放置信修复（upscale algo3 0.208→0.023）
+- v1.9：**algo=6 受约束细节迁移**（零空间投影 + 法向 1D + q×ms 复合置信）；
+  门控统计量分类器评测基建（eval_gates.py：ROC/风险覆盖、获益标签）；
+  时域指标改对齐边缘带误差方差；新残差案例 misalign1（亚色度相位错位）
 
 ---
 
@@ -97,6 +101,7 @@ diff   = core.std.MakeDiff(guided, plain)
 out = core.lgcr.Recon(src, algo=2)   # 默认，真实视频最稳
 out = core.lgcr.Recon(src, algo=4)   # 逐像素选择器，硬色边素材（屏幕录制/图形/字幕）更佳
 out = core.lgcr.Recon(src, algo=3, reg=0.01)  # LGF 回归路线（文献基线）
+out = core.lgcr.Recon(src, algo=6)   # 受约束细节迁移（零空间安全；实验性，见 §3.3）
 out = core.lgcr.Recon(src, algo=5)   # NEDI-lite（仅同尺寸；研究基线，不推荐实用）
 out = core.lgcr.Recon(src, algo=1)   # v1.2 历史版本对照
 ```
@@ -157,7 +162,7 @@ vspipe --y4m script.vpy - | ffmpeg -i - -c:v libx265 -crf 16 out.mkv
 | `loc` | 未设时读 `_ChromaLocation` | 水平 siting；垂直 siting 由 H.273 属性（topleft/top/bottomleft/bottom）自动处理；输出 444 会删除该属性 |
 | `kernel` | `"lanczos"` | `"bilinear"` / `"bicubic"`(b,c 可调) / `"lanczos"`(taps) / `"spline16"` / `"spline36"` / `"jinc"`(taps) |
 | `taps` | 3 | lanczos/jinc 的瓣数 |
-| `algo` | 2 | 重建算法：`1`=v1.2 历史版；`2`=v1.3 引导选择（默认）；`3`=LGF 局部线性回归；`4`=逐像素选择器；`5`=NEDI-lite（仅同尺寸） |
+| `algo` | 2 | 重建算法：`1`=v1.2 历史版；`2`=v1.3 引导选择（默认）；`3`=LGF 局部线性回归；`4`=逐像素选择器；`5`=NEDI-lite（仅同尺寸）；`6`=受约束细节迁移（实验性） |
 | `strength` | 0.8 | 引导/修正强度 λ；**0 = 纯核**（A/B 对照基准，走快速路径） |
 | `sigma` | 0.01 | 亮度相似度 σ 下限（归一化单位），相当于噪声地板 |
 | `sratio` | 0.15 | 自适应拐点：`sig ≥ sratio · 窗内亮度range` |
@@ -263,8 +268,35 @@ ratio=1.00、dcent=0 → gate 1。亮度侧用 footprint 盒平均的 lc 图（�
 | 3 | LGF：C ≈ a·Y+b 局部回归 + ms 门控 | 合成硬边/上采样最佳（hard_d45 0.0413、upscale2x 0.0227）；真实图像仍有结构迁移代价 |
 | 4 | 逐像素选择器：硬边程度 × 轴/对角 → 路由 algo2/algo3/纯核 | 全能型：硬边接近 algo3，其余场景贴 plain |
 | 5 | NEDI-lite：4-tap 协方差自适应（数据自引导） | 研究基线，全线落败（见 §5） |
+| 6 | 受约束细节迁移：`C1 = C0 + g·a·(Y − Yb)`（下述） | 合成电池强（d45 0.066、upscale 0.024、noise 最佳）；真实图像边缘带有迁移代价，实验性 |
 
-### 3.3 Sharpen（gated Laplacian）
+### 3.3 algo=6：受约束细节迁移（零空间安全）
+
+不替换纯核输出，只补它丢掉的细节：
+
+```
+C0 = P(C420)                  # 纯核基底（低频与颜色基准）
+Yc = D̂(Y)，Yb = P(Yc)         # 匹配退化亮度及其纯核上采样
+C1 = C0 + g · a · lp_t(Y − Yb)
+```
+
+- `a`：色度网格 5×5 窗回归斜率 cov(Yc,C)/var(Yc)，对候选退化核
+  {box, triangle, bicubic} 分别估计后按各自 q 加权平均（编码器 D 未知，
+  只有多核结论稳定才接受：g 含 qmin/qmax 稳定性因子）。
+- `g`：复合置信 = q（U/V 联合仿射可信度，`(covU²+covV²)/((varY+ε)(varU+varV+ε))`）
+  × 多核稳定性 × 色度显著性 × **ms 共边门** × strength。
+- `lp_t`：两级保护——① 可分离二项式 [1,2,1] 低通：亮度 Nyquist 交替模
+  (-1)^x 处于**一切**对称 2× 抽取核的零空间中，任何低分辨率统计量都无法
+  证实它属于色度，唯一防御是投影移除（评审零空间反例：algo3 注入后 MAE
+  1.017，algo6 0.0245 = 正常硬边收益）；② 沿结构张量切向平滑（coherence
+  加权），切向亮度纹理不注入（法向 1D 迁移）。
+- 幅度上限（|ΔC| ≤ ½·窗内色度 range）+ hull clamp。strength=0 ≡ 纯核逐位一致。
+
+与 algo3（LGF）的本质区别：LGF 用 `a·Y+b` **整体替换**色度（含低频），其结构
+迁移误差是内禀的；algo6 的低频/颜色来自纯核，仿射模型只提供缺失的高频细节，
+且细节先经零空间投影。
+
+### 3.4 Sharpen（gated Laplacian）
 
 `HP = Σ n_i(x₀−x_i)/Σ n_i`（`n_i = 空间bump × sim`），`out = x₀ + α·HP`，
 hull clamp。门控拉普拉斯：边缘处 HP≈0（无 halo 的来源），软过渡带肩部收紧。
@@ -274,25 +306,44 @@ hull clamp。门控拉普拉斯：边缘处 HP≈0（无 halo 的来源），软
 
 ## 4. 评测结果
 
-### 可复现评测电池（test/battery.py，v1.8 mutual-structure 后）
+### 可复现评测电池（test/battery.py，v1.9）
 
 `python3 test/battery.py [--all]`，结果写入 `test/results/latest.md`。
-当前成绩（jinc3，strength=0.8；注意 strength 是连续的，0.8 ≠ 全强度，
-硬边最大吸附在 1.0 处，hard_v 可达 0.0182）：
+当前成绩（jinc3，strength=0.8；strength 是连续的，0.8 ≠ 全强度）：
 
-| case | plain | algo2 | algo3 | algo4 | 判定（algo2） |
+| case | plain | algo2 | algo3 | algo4 | algo6 |
 |---|---|---|---|---|---|
-| hard_v（严格共边硬边） | 0.0363 | **0.0236** | **0.0169** | 0.0218 | 赢 |
-| hard_d45（对角硬边） | 0.0881 | 0.0797 | **0.0413** | **0.0413** | 赢 |
-| isoluminant（无亮度边色边） | 0.0363 | 0.0363 | 0.0363 | 0.0363 | 中性（无信息即不动） |
-| misalign4（Y/C 错位 4px） | 0.0203 | 0.0203 | 0.0203 | 0.0203 | 中性（ms 门控：非共边不转移，正确语义） |
-| hardL_softC（硬亮度边+软色度） | **0.0056** | 0.0059 | 0.0056 | 0.0057 | 中性（ms 门控修复，曾是唯一输掉 3× 的用例） |
-| ridge_line（线稿） | 0.0018 | 0.0018 | 0.0052 | 0.0018 | 中性（ridge 淡化生效） |
-| ramp | 0.0051 | 0.0051 | 0.0082 | 0.0055 | 中性 |
-| texture | 0.0120 | 0.0120 | 0.0120 | 0.0120 | 中性 |
-| noise（σ=0.008） | 0.0375 | 0.0376 | 0.0489 | 0.0381 | 中性 |
-| upscale2x | 0.0386 | 0.0337 | **0.0227** | 0.0329 | 赢（源空间引导） |
-| temporal（边缘移动 1px） | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 静态区零闪烁 |
+| hard_v（严格共边硬边） | 0.0363 | **0.0236** | **0.0169** | 0.0218 | 0.0245 |
+| hard_d45（对角硬边） | 0.0881 | 0.0797 | **0.0413** | **0.0413** | **0.0655** |
+| isoluminant（无亮度边色边） | 0.0363 | 0.0363 | 0.0363 | 0.0363 | 0.0363 |
+| misalign4（Y/C 错位 4px） | 0.0203 | 0.0203 | 0.0203 | 0.0203 | 0.0203 |
+| misalign1（亚色度相位错位 0.5cp） | **0.0156** | 0.0334 | 0.0570 | 0.0360 | 0.0299 |
+| nullspace（零空间纹理反例） | 0.0363 | 0.0363 | 1.0172 | 0.0363 | **0.0245** |
+| hardL_softC（硬亮度边+软色度） | **0.0056** | 0.0059 | 0.0056 | 0.0057 | 0.0056 |
+| ridge_line（线稿） | **0.0018** | 0.0018 | 0.0052 | 0.0018 | 0.0026 |
+| ramp | 0.0051 | 0.0051 | 0.0082 | 0.0055 | 0.0051 |
+| texture | 0.0120 | 0.0120 | 0.0120 | 0.0120 | 0.0120 |
+| noise（σ=0.008） | 0.0375 | 0.0376 | 0.0489 | 0.0381 | **0.0288** |
+| upscale2x | 0.0386 | 0.0337 | **0.0227** | 0.0329 | **0.0237** |
+| temporal（对齐边缘带误差方差） | 0.00017 | 0.00015 | 0.00004 | 0.00011 | 0.00014 |
+
+misalign1 是当前唯一已知显著残差：亚色度像素 Y/C 相位错位使吸附把边缘物理
+搬错位置，门控无法分辨（质心估计在 ±3 窗内太粗），答案是路线图上的相位补偿
+而非门控。nullspace 是评审构造的 r² 反例：algo3 整体替换路线灾难性注入
+（1.017），algo6 的零空间投影使其退化为正常硬边收益。
+
+### 门控统计量的分类器评测（test/eval_gates.py）
+
+获益标签 = "启用机制相对纯核是否获益"（非人为硬/软语义）；124 个参数化样本
+（软度 × 亚色度相位错位 × 朝向 × 对比度 + 反例族）。
+
+对"无门控吸附"标签（algo2 ms=0 vs plain）：cedge 现状 AUC 0.746，
+**旋转等变剖面宽度版 0.860（宽度路线 ROC 天花板）**，ms 0.594，q_min 0.634。
+ms/q 在此标签上低分的主因是亚色度相位样本（机制性失败，非门控可解）。
+
+对"细节迁移"标签（algo6 ms=0 vs plain，q 的本职标签）：
+**q_min 0.907（多核取 min 优于单 box 0.879）、ms 0.856、q×ms 复合 0.925**——
+评审的复合设计定量成立。
 
 时域用例（plain / algo2 / **TRecon**）：
 
@@ -314,16 +365,18 @@ TRecon 的可验证收益是静态降噪与"无退化保证"；奇数相位分�
 
 ### 真实图像（动画截图 1920×1080：大面积天空渐变 + 细线稿；8bit 管线，v1.8 重测）
 
-| | plain | algo1 | algo2 | algo3 | algo4 | algo5 |
-|---|---|---|---|---|---|---|
-| 全帧 | **0.383** | 0.400 | 0.385 | 0.551 | 0.390 | 0.695 |
-| 边缘带 | **1.529** | 1.729 | 1.549 | 3.146 | 1.564 | 3.545 |
-| 平滑带 | **0.325** | 0.330 | 0.326 | 0.439 | 0.331 | 0.578 |
+| | plain | algo1 | algo2 | algo3 | algo4 | algo5 | algo6 |
+|---|---|---|---|---|---|---|---|
+| 全帧 | **0.383** | 0.400 | 0.385 | 0.551 | 0.390 | 0.695 | 0.388 |
+| 边缘带 | **1.529** | 1.729 | 1.549 | 3.146 | 1.564 | 3.545 | 1.805 |
+| 平滑带 | **0.325** | 0.330 | 0.326 | 0.439 | 0.331 | 0.578 | 0.326 |
 
 解读：这张图 95% 是平滑渐变，几乎没有可恢复空间，引导类的收益集中在硬色边
 素材（合成硬边 +67%/+38%）。algo2/algo4 的设计目标是"**不该动的地方不动**"——
 真实图像上与 plain 的差距压到了 0.5%（algo2）/ 2%（algo4）。algo3 在真实图像
 上的结构迁移代价是 C-Y 关系非线性的内禀属性，ms 门控只能挡掉错位/软边两类。
+algo6 全帧贴平 plain，但边缘带的迁移代价（1.81）高于 algo2（1.55）——合成
+内容上的强收益在真实照片上需要更谨慎的 g，故默认仍为 algo2。
 
 ### f32 输入的影响
 
@@ -390,6 +443,17 @@ plain/algo2 微幅改善（0.349→0.333，少一次 8bit 舍入）；algo3 无�
     （截断核归一化 vs tap 钳制）使 strength 0 与 1e-6 在边界差 0.05。
     现在 plain ≡ reconstructChroma(strength=0)，连续性精确成立；代价是
     plain 慢约 2.5×（211 vs 79 ms/帧），留待逐输出像素 SIMD 优化。
+18. **零空间安全的细节迁移必须投影，不能靠统计量**。亮度 Nyquist 交替模
+    (-1)^x 在所有对称 2× 抽取核的零空间中——任何低分辨率统计量（r²、q、
+    多核一致性、数据一致性 BP）都无法证实它。唯一防御是把待迁移细节先经
+    二项式低通投影出零空间。评审反例上 LGF 整体替换 MAE 1.017，投影后
+    的 algo6 为 0.0245（= 正常硬边收益）。
+19. **宽度检测路线有实测 ROC 天花板 0.860**（旋转等变法向剖面 + 10–90% 上升
+    距离，AUC；现状 max 投影版 0.746）。不够作独立检测器——这正是 cedge
+    类方法的上限，学术评测不应再用更弱的基线。
+20. **亚色度相位错位（0.5 chroma px）是吸附机制的机制性失败**（misalign1：
+    +0.026，全场最大单点失败），质心相位估计在 ±3 窗内无法分辨——此类误差
+    需要相位补偿（估计并移位吸附目标），不是任何门控能解决的。
 
 ---
 
@@ -453,12 +517,11 @@ SIMD 设计要点：
 
 ## 8. 后续研究方向
 
-- **Kernel-derived phase**：当前 φ 仅几何计算。更激进的形式是从 Lanczos 在 Y
-  上的局部响应直接提取相位误差（比较相邻相位 polyphase 分量的能量），检测
-  chroma 与 luma 的亚像素失配并做相位补偿。
+- **Kernel-derived phase**（misalign1 残差的正解）：估计亚色度像素的 Y/C 相位
+  偏移并平移吸附/迁移目标（比较相邻相位 polyphase 分量的能量），而非门控。
 - **边缘 alpha-profile（动画线稿专项）**：拟合两侧颜色 + 共享覆盖率 α(x) 的
   三段式 ridge 模型。ms 门控已使 hardL_softC 回退 plain（不再输），alpha-profile
-  的目标是在该类内容上**赢过** plain。
+  的目标是在该类内容上**赢过** plain；algo6 的法向 1D 迁移是其前置。
 - **沿边缘方向的高阶核**：当前 bump 是 Lorentzian；把沿边缘分量换成 Lanczos
   轮廓（保留负瓣锐化）可能进一步减少沿边缘模糊。
 - **两阶段 NEDI + siting 校正**：algo=5 的正经实现。
@@ -479,11 +542,12 @@ src/lgcr.h          共享声明（结构体、inline 核函数、转换模板�
 src/maps.cpp        引导图构建（结构张量 / db / Lc / mutual-structure 门控）+ BilinAxis
 src/kernels.cpp     权重表、可分离/径向重采样、色度轴
 src/recon.cpp       reconstructChroma（引导主路径）+ plainChroma
-src/algos.cpp       LGF / selector blend / NEDI-lite / sharpenPlane
-src/plugin.cpp      VapourSynth 胶水（Recon + Sharpen 注册与调度）
+src/algos.cpp       LGF / selector blend / NEDI-lite / sharpenPlane / algo6 仿射映射与细节迁移
+src/plugin.cpp      VapourSynth 胶水（Recon + Sharpen + TRecon 注册与调度）
 Makefile            make / make liblgcr_scalar.so（正确性交叉验证用）
 test/test_lgcr.py   合成边缘消融测试（平坦区/垂直边/对角边 + AVX2对标量）
-test/battery.py     正式评测电池（11 场景含错位/等亮度/线稿/噪声/2×/时域）
+test/battery.py     正式评测电池（13 场景含错位/亚色度相位/零空间/线稿/噪声/2×/时域）
+test/eval_gates.py  门控统计量分类器评测（获益标签、ROC/风险覆盖曲线）
 test/recon_image.py 静态图管线（PNG → 模拟420退化 → 重建 → PNG）
 test/selfguide_y.py Y 自引导 oracle 实验（阴性结果，见 §5 第 10 条）
 ```
