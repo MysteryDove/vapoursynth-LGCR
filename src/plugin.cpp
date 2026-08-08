@@ -89,6 +89,11 @@ static void VS_CC sharpenCreate(const VSMap *in, VSMap *out, void *, VSCore *cor
     d->sratio = vsapi->mapGetFloatSaturated(in, "sratio", 0, &err); if (err) d->sratio = 0.15;
     d->gspatial = vsapi->mapGetFloatSaturated(in, "gspatial", 0, &err); if (err) d->gspatial = 1.2;
     d->arMargin = vsapi->mapGetFloatSaturated(in, "ar", 0, &err); if (err) d->arMargin = 0.0;
+    if (d->sigma <= 0.0 || d->sratio <= 0.0 || d->gspatial <= 0.0) {
+        vsapi->mapSetError(out, "LGCR Sharpen: sigma/sratio/gspatial must be > 0");
+        vsapi->freeNode(d->node);
+        return;
+    }
 
     SharpenData *data = d.release();
     VSFilterDependency deps[] = { { data->node, rpGeneral } };
@@ -324,8 +329,12 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
     const int trad = d->trad;
     if (activationReason == arInitial) {
         const int nLast = d->viIn->numFrames - 1;
-        for (int k = -trad; k <= trad; ++k)
-            vsapi->requestFrameFilter(std::clamp(n + k, 0, nLast), d->node, frameCtx);
+        for (int k = -trad; k <= trad; ++k) {
+            const int fn = std::clamp(n + k, 0, nLast);
+            if (k != 0 && fn == n)
+                continue; // clamped to the current frame: no temporal content
+            vsapi->requestFrameFilter(fn, d->node, frameCtx);
+        }
         return nullptr;
     }
     if (activationReason != arAllFramesReady)
@@ -339,7 +348,7 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
     const int cw = vsapi->getFrameWidth(src, 1);
     const int ch = vsapi->getFrameHeight(src, 1);
     const bool isFloat = fmt->sampleType == stFloat;
-    const double yScale = isFloat ? 1.0 : double((1 << fmt->bitsPerSample) - 1);
+    const double yScale = isFloat ? 1.0 : 1.0 / double((1 << fmt->bitsPerSample) - 1);
     const double cOffset = isFloat ? 0.0 : -0.5;
     const double rw = double(sw) / cw, rh = double(sh) / ch;
 
@@ -377,7 +386,11 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
         for (int k = -trad; k <= trad; ++k) {
             if (k == 0)
                 continue;
-            const VSFrame *nf = vsapi->getFrameFilter(std::clamp(n + k, 0, nLast), d->node, frameCtx);
+            const int fn = std::clamp(n + k, 0, nLast);
+            if (fn == n)
+                continue; // boundary clamp: a duplicated current frame is not
+                          // temporal information (its "gain" was an artifact)
+            const VSFrame *nf = vsapi->getFrameFilter(fn, d->node, frameCtx);
             auto ny = std::make_unique<Plane>(sw, sh);
             auto nu = std::make_unique<Plane>(cw, ch);
             auto nv = std::make_unique<Plane>(cw, ch);
@@ -499,6 +512,14 @@ static void VS_CC tReconCreate(const VSMap *in, VSMap *out, void *, VSCore *core
     d->trad = vsapi->mapGetIntSaturated(in, "trad", 0, &err); if (err) d->trad = 1;
     d->tsearch = vsapi->mapGetIntSaturated(in, "tsearch", 0, &err); if (err) d->tsearch = 6;
     d->tsad = vsapi->mapGetFloatSaturated(in, "tsad", 0, &err); if (err) d->tsad = 0.02;
+    if (d->strength < 0.0 || d->strength > 1.0 || d->sigma <= 0.0 || d->sratio <= 0.0 ||
+        d->sdb <= 0.0 || d->stretch < 0.0 || d->gsigma <= 0.0 ||
+        d->trad < 0 || d->trad > 8 || d->tsearch < 0 || d->tsearch > 64 || d->tsad <= 0.0) {
+        vsapi->mapSetError(out, "TRecon: invalid parameter range (need 0<=strength<=1, "
+                                "sigma/sratio/sdb/gsigma/tsad>0, stretch>=0, 0<=trad<=8, 0<=tsearch<=64)");
+        vsapi->freeNode(d->node);
+        return;
+    }
     {
         const int64_t ri = vsapi->mapGetIntSaturated(in, "ridge", 0, &err);
         d->ridge = err ? true : (ri != 0);
@@ -583,7 +604,7 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
         d->kp2 = vsapi->mapGetFloatSaturated(in, "c", 0, &err); if (err) d->kp2 = 0.6;
     } else if (k == "lanczos") {
         d->kernel = Kernel::Lanczos;
-        d->kp1 = vsapi->mapGetFloatSaturated(in, "taps", 0, &err); if (err) d->kp1 = 3.0;
+        d->kp1 = double(vsapi->mapGetIntSaturated(in, "taps", 0, &err)); if (err) d->kp1 = 3.0;
         d->support = d->kp1;
     } else if (k == "spline16") {
         d->kernel = Kernel::Spline16;
@@ -594,7 +615,7 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
     } else if (k == "jinc") {
         d->kernel = Kernel::Jinc;
         d->radial = true;
-        d->kp1 = vsapi->mapGetFloatSaturated(in, "taps", 0, &err); if (err) d->kp1 = 3.0;
+        d->kp1 = double(vsapi->mapGetIntSaturated(in, "taps", 0, &err)); if (err) d->kp1 = 3.0;
         d->support = d->kp1;
         // Radial profile LUT, 1024 entries per unit distance
         const int n = static_cast<int>(d->support * 1024) + 2;
@@ -636,12 +657,6 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
     d->arMargin = vsapi->mapGetFloatSaturated(in, "ar", 0, &err); if (err) d->arMargin = 0.0;
     d->reg = vsapi->mapGetFloatSaturated(in, "reg", 0, &err); if (err) d->reg = 0.005;
 
-    if (d->strength < 0.0 || d->strength > 1.0 || d->sigma <= 0.0 || d->sratio <= 0.0 ||
-        d->stretch < 0.0 || d->gsigma <= 0.0) {
-        fail("LGCR: invalid strength/sigma/sratio/stretch/gsigma");
-        return;
-    }
-
     const char *loc = vsapi->mapGetData(in, "loc", 0, &err);
     if (!err) {
         std::string l = loc;
@@ -662,6 +677,15 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
     d->bp = vsapi->mapGetFloatSaturated(in, "bp", 0, &err); if (err) d->bp = 0.0;
     if (fmt->subSamplingW == 0)
         d->shiftX = 0.0;
+
+    if (d->strength < 0.0 || d->strength > 1.0 || d->sigma <= 0.0 || d->sratio <= 0.0 ||
+        d->sdb <= 0.0 || d->stretch < 0.0 || d->gsigma <= 0.0 || d->reg <= 0.0 ||
+        d->bp < 0.0 || d->bp > 1.0 ||
+        ((d->kernel == Kernel::Lanczos || d->kernel == Kernel::Jinc) && d->kp1 < 1.0)) {
+        fail("LGCR: invalid parameter range (need 0<=strength<=1, 0<=bp<=1, "
+             "sigma/sratio/sdb/gsigma/reg>0, stretch>=0, taps>=1)");
+        return;
+    }
 
     // Output video info: YUV444, same depth/type
     d->viOut = *d->viIn;

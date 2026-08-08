@@ -361,7 +361,9 @@ void blendSelector(Plane &outU, Plane &outV,
 void backProject(Plane &cOut, const Plane &cSrc, float bp);
 
 // Integer-pel luma block matching (TRecon). Fills mvx/mvy/conf on a
-// blockSize grid; conf = 1/(1 + (sad_per_px/tsad)^2).
+// blockSize grid; conf = matchQuality x observability, where observability
+// comes from the luma block variance (flat blocks have no observable motion
+// -> conf ~ 0). Equal-SAD ties and near-ties resolve toward zero motion.
 void blockMatch(const Plane &cur, const Plane &nbr, int blockSize, int search,
                 float tsad, std::vector<int16_t> &mvx, std::vector<int16_t> &mvy,
                 std::vector<float> &conf, int &bw, int &bh);

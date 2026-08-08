@@ -319,8 +319,16 @@ void blockMatch(const Plane &cur, const Plane &nbr, int blockSize, int search,
             const int x0 = bx * blockSize, y0 = by * blockSize;
             const int bw_ = std::min(blockSize, cur.w - x0);
             const int bh_ = std::min(blockSize, cur.h - y0);
-            float best = 1e30f;
+            float best = 1e30f, sad0 = 1e30f;
+            double sum = 0.0, sum2 = 0.0;
             int bdx = 0, bdy = 0;
+            for (int j = 0; j < bh_; j += 2)
+                for (int i = 0; i < bw_; i += 2) {
+                    const float v = cur.at(x0 + i, y0 + j);
+                    sum += v;
+                    sum2 += double(v) * v;
+                }
+            const float npix = float((bw_ + 1) / 2 * ((bh_ + 1) / 2));
             for (int dy = -search; dy <= search; ++dy)
                 for (int dx = -search; dx <= search; ++dx) {
                     if (x0 + dx < 0 || y0 + dy < 0 ||
@@ -331,18 +339,42 @@ void blockMatch(const Plane &cur, const Plane &nbr, int blockSize, int search,
                         for (int i = 0; i < bw_; i += 2)
                             sad += std::fabs(cur.at(x0 + i, y0 + j) -
                                              nbr.at(x0 + dx + i, y0 + dy + j));
-                    if (sad < best) {
+                    if (dx == 0 && dy == 0)
+                        sad0 = sad;
+                    // Equal SAD: prefer the smaller motion (zero-motion
+                    // bias). On a straight edge the tangential component is
+                    // unobservable (aperture problem) but harmless — the
+                    // fetched samples are identical along iso-contours.
+                    const int mnorm = std::abs(dx) + std::abs(dy);
+                    const int bnorm = std::abs(bdx) + std::abs(bdy);
+                    if (sad < best || (sad == best && mnorm < bnorm)) {
                         best = sad;
                         bdx = dx;
                         bdy = dy;
                     }
                 }
+            // Zero-motion snap: accept a nonzero vector only when it beats
+            // staying put by a real margin. In noisy flat blocks the search
+            // otherwise mines a random small vector out of the noise.
+            if ((bdx != 0 || bdy != 0) && sad0 - best <= 0.10f * tsad * npix) {
+                bdx = 0;
+                bdy = 0;
+                best = sad0;
+            }
             const size_t idx = size_t(by) * bw + bx;
             mvx[idx] = int16_t(bdx);
             mvy[idx] = int16_t(bdy);
-            const float npix = float((bw_ + 1) / 2 * ((bh_ + 1) / 2));
             const float sadPx = best / npix;
-            conf[idx] = 1.0f / (1.0f + sadPx * sadPx * invT2);
+            // match quality x observability. Motion is only observable where
+            // the LUMA block has texture: a flat block matches everywhere
+            // (margin-based uniqueness fails differently: it also fires on
+            // straight edges via the aperture ambiguity). The earlier
+            // first-scan tie rule picked a far corner at FULL confidence and
+            // dragged chroma texture across the frame (0.012 -> 0.059).
+            const float var = float(std::max(0.0, sum2 / npix - (sum / npix) * (sum / npix)));
+            const float matchQ = 1.0f / (1.0f + sadPx * sadPx * invT2);
+            const float uniq = var / (var + 0.25f * tsad * tsad);
+            conf[idx] = matchQ * uniq;
         }
 }
 

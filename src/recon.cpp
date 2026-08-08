@@ -457,12 +457,21 @@ void reconstructChroma(const ChromaJob &job) {
 
             // Temporal taps (TRecon): each motion-compensated neighbor frame
             // contributes its ACTUAL chroma sample nearest the mapped
-            // position — odd luma-pel motion lands it at a different 420
-            // phase, which is genuinely new sampling information. Weighted
-            // by the same sim/bump machinery plus the ME block confidence.
+            // position. The neighbor sample at (tnx,tny) holds current-frame
+            // content at (tnx - mx/rw, tny - my/rh) chroma px; its weight is
+            // the BASE KERNEL evaluated at that true offset — the tap is just
+            // an off-lattice spatial sample, modulated by sim and the ME
+            // block confidence. Phase novelty gate: motion by an ODD number
+            // of luma px shifts the 420 sampling phase by half a chroma px
+            // (genuinely new information); integer chroma-pel motion
+            // re-samples the same lattice and only dilutes the signed base
+            // kernel, so it is gated to zero for moving blocks. (An earlier
+            // version keyed novelty on the rounding residual ddx, which
+            // rewarded exactly the redundant even-pel case.)
             if (guided && job.nbrs && !job.nbrs->empty()) {
                 const int lx = std::clamp(int(ax.lpos[ox]), 0, job.srcLumaW - 1);
                 const int ly = std::clamp(int(ay.lpos[oy]), 0, job.srcLumaH - 1);
+                const float frw = float(job.rw), frh = float(job.rh);
                 for (const TemporalNbr &nb : *job.nbrs) {
                     const int bxx = std::min(nb.bw - 1, lx / nb.block);
                     const int byy = std::min(nb.bh - 1, ly / nb.block);
@@ -473,30 +482,86 @@ void reconstructChroma(const ChromaJob &job) {
                     const float mx = float((*nb.mvx)[bi]);
                     const float my = float((*nb.mvy)[bi]);
                     // nearest neighbor chroma sample to the mapped position
-                    const int tnx = std::clamp(int(std::lround(scx + mx / float(job.rw))),
+                    const int tnx = std::clamp(int(std::lround(scx + mx / frw)),
                                                0, nb.U->w - 1);
-                    const int tny = std::clamp(int(std::lround(scy + my / float(job.rh))),
+                    const int tny = std::clamp(int(std::lround(scy + my / frh)),
                                                0, nb.U->h - 1);
-                    // its offset from the target, in current-frame luma px
-                    const float ddx = (tnx - scx) * float(job.rw) - mx;
-                    const float ddy = (tny - scy) * float(job.rh) - my;
-                    const float dL = nb.lc->at(tnx, tny) - L0;
-                    const float simRaw = 1.0f / (1.0f + dL * dL * invSigma2);
-                    const float sim = 1.0f - guideFade * (1.0f - simRaw);
-                    const float bump = 1.0f / (1.0f + (ddx * ddx + ddy * ddy) * invGsigma2);
+                    // offset of the content it represents from the target,
+                    // in current-frame luma px (<= half a chroma px after
+                    // the nearest-sample rounding above)
+                    const float ddx = (tnx - scx) * frw - mx;
+                    const float ddy = (tny - scy) * frh - my;
+                    const bool staticBlk0 = (std::fabs(mx) + std::fabs(my) <= 1.0f) && tconf > 0.5f;
+                    float dL;
+                    if (staticBlk0) {
+                        // Static averaging: same content, level noise is what
+                        // we average away -> lenient footprint-level test.
+                        dL = nb.lc->at(tnx, tny) - L0;
+                    } else {
+                        // Moving block: EXACT footprint-straddle test against
+                        // the sharp SOURCE luma. The tap is a box average over
+                        // the motion-compensated footprint; if ANY source luma
+                        // sample inside that box differs from L0, the tap
+                        // straddles a luma edge and its value is a cross-side
+                        // mixture. A level test against the footprint-average
+                        // lc cannot see a partial straddle (7% straddle moved
+                        // lc by only 0.0125 with sigma=0.01) — this caused the
+                        // odd-pel-motion regression.
+                        const Plane &sY = *job.srcY;
+                        const double lx = (tnx + 0.5) * job.rw - 0.5 + job.shiftX - mx;
+                        const double ly = (tny + 0.5) * job.rh - 0.5 + job.shiftY - my;
+                        const int x0 = int(std::ceil(lx - 0.5 * job.rw));
+                        const int x1 = int(std::ceil(lx + 0.5 * job.rw));
+                        const int y0 = int(std::ceil(ly - 0.5 * job.rh));
+                        const int y1 = int(std::ceil(ly + 0.5 * job.rh));
+                        float md = 0.0f;
+                        for (int jj = y0; jj < y1; ++jj)
+                            for (int ii = x0; ii < x1; ++ii)
+                                md = std::max(md, std::fabs(sY.at(ii, jj) - L0));
+                        dL = md;
+                    }
+                    const float sigT = staticBlk0 ? sigLoc : 0.5f * sigLoc; // sigLoc >= sigma > 0
+                    const float simRaw = 1.0f / (1.0f + dL * dL / (sigT * sigT));
+                    // Moving taps are all-or-nothing additives: use simRaw
+                    // directly (the guideFade blend toward 1 exists for the
+                    // spatial kernel's gradual strength semantics; here it
+                    // would let half-rejected taps through at ~0.3 weight).
+                    const float sim = staticBlk0 ? 1.0f - guideFade * (1.0f - simRaw) : simRaw;
+                    // base-kernel weight at the true (post-rounding) offset
+                    float kw;
+                    if (radial) {
+                        const float dxc = ddx / frw * invWxC;
+                        const float dyc = ddy / frh * invWyC;
+                        kw = lutLookup(lut, lutN,
+                            std::sqrt(dxc * dxc + dyc * dyc) * d.lutScale);
+                    } else {
+                        kw = float(kernelEval(d.kernel, std::fabs(ddx) / job.rw * invWxC,
+                                              d.kp1, d.kp2) *
+                                   kernelEval(d.kernel, std::fabs(ddy) / job.rh * invWyC,
+                                              d.kp1, d.kp2));
+                    }
                     // Static blocks: redundant taps are pure temporal
-                    // averaging (denoise) -> keep full weight. Moving blocks:
-                    // a redundant tap just dilutes the signed base kernel
-                    // with blur, so require phase NOVELTY — only odd luma-pel
-                    // offsets land on a different 420 sampling phase.
-                    const bool staticBlk = (std::fabs(mx) + std::fabs(my) <= 1.0f) && tconf > 0.5f;
+                    // averaging (denoise) -> keep full weight. Moving blocks
+                    // require phase NOVELTY: the fractional part of the
+                    // motion in chroma units must be ~1/2 (odd luma-pel),
+                    // otherwise the tap re-samples the existing lattice.
+                    const bool staticBlk = staticBlk0;
                     float nw = 1.0f;
                     if (!staticBlk) {
-                        const float sx = std::fabs(std::sin(float(M_PI) * ddx / (2.0f * float(job.rw))));
-                        const float sy = std::fabs(std::sin(float(M_PI) * ddy / (2.0f * float(job.rh))));
-                        nw = std::max(sx, sy);
+                        const float fx = mx / frw, fy = my / frh;
+                        const float px = fx - std::floor(fx); // [0,1)
+                        const float py = fy - std::floor(fy);
+                        nw = std::max(std::fabs(std::sin(float(M_PI) * px)),
+                                      std::fabs(std::sin(float(M_PI) * py)));
+                        // Transitional (ramp-like) luma: the footprint-luma
+                        // sim cannot assign a side there (the half-value edge
+                        // column averages both sides), so a motion-compensated
+                        // tap cannot be validated -> drop it. Taps fire only
+                        // where the guide can discriminate (hard steps) or on
+                        // static blocks (pure averaging).
+                        nw *= 1.0f - ssRamp;
                     }
-                    const float w = tconf * sim * bump * nw;
+                    const float w = tconf * sim * kw * nw;
                     accU += double(w) * nb.U->at(tnx, tny);
                     accV += double(w) * nb.V->at(tnx, tny);
                     wsum += w;
