@@ -12,27 +12,35 @@ kernel on this sample", not to match a human hard/soft semantic.
 
 Statistics under test (all recomputed here in numpy from the SAME degraded
 planes the plugin sees):
-  cedge_cur  - current in-plugin width fade (max-projection, per-plane max)
-  cedge_eq   - rotation-equivariant normal-profile 10-90% width version
+  cedge_proxy - legacy max-projection width fade proxy (not pixel-exact plugin output)
+  width_eq   - corrected rotation-equivariant normal-profile width baseline
   ms         - in-plugin mutual-structure gate (participation width + centroid)
   q_box/q_tri/q_bic - affine credibility with candidate degradation kernels
-  q_min      - min over candidate kernels (unknown-D stability)
-  qxms       - q_min x ms (the composite the review argues for)
+  q_min      - pixelwise min over candidate kernels
+  q_prod     - production qMean * (qmin/qmax) * chroma significance
+  q_prod_ms  - mean of the per-pixel production q * ms composite
 
 Outputs: AUC per statistic + risk/coverage table
 (risk = mean signed MAE delta vs plain among accepted samples; negative = win).
+Every generated source is evaluated under box, triangle, and bicubic ACTUAL
+4:2:0 degradations; these are independent of the three candidate q models.
 
 Usage: python3 test/eval_gates.py
 """
+import io
+import os
+import sys
+
 import numpy as np
 import vapoursynth as vs
 
 core = vs.core
 core.num_threads = 8
-core.std.LoadPlugin("/home/owen/dev/bsflab/liblgcr.so")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+core.std.LoadPlugin(os.path.join(ROOT, "liblgcr.so"))
 
 W, H = 128, 128
-F444 = core.query_video_format(vs.YUV, vs.FLOAT, 32, 0, 0)
 F420 = core.query_video_format(vs.YUV, vs.FLOAT, 32, 1, 1)
 
 YY, XX = np.mgrid[0:H, 0:W]
@@ -42,8 +50,9 @@ YY, XX = np.mgrid[0:H, 0:W]
 # sample generation
 # ---------------------------------------------------------------------------
 
-def make_clip(Yf, Uf, Vf):
-    blank = core.std.BlankClip(width=W, height=H, format=F444, length=1)
+def make_420_clip(Yf, Uf, Vf):
+    """Construct the decoder-visible source without asking zimg to choose D."""
+    blank = core.std.BlankClip(width=W, height=H, format=F420, length=1)
     def fill(n, f):
         f = f.copy()
         np.copyto(np.asarray(f[0]), Yf)
@@ -56,13 +65,11 @@ def make_clip(Yf, Uf, Vf):
 def edge_sample(soft=0, shift=0, angle=0.0, contrast=0.55, luma_step=0.05,
                 noise=0.0, seed=7):
     """Hard/soft co-edged or misaligned edge. angle in degrees (0 = vertical)."""
-    if angle == 0.0:
-        tcoord = XX
-    elif angle == 45.0:
-        tcoord = (XX + YY) / 2.0
-    else:  # 22.5
-        tcoord = XX * 0.924 + YY * 0.383
-    e = 64.0 if angle == 0.0 else 64.0
+    rad = np.deg2rad(angle)
+    # Signed normal coordinate in luma pixels; all orientations and shifts now
+    # have the same physical scale and pass through the frame center.
+    tcoord = (XX - 64.0) * np.cos(rad) + (YY - 64.0) * np.sin(rad) + 64.0
+    e = 64.0
     tY = np.clip(tcoord - e + 0.5, 0, 1)
     if soft:
         tC = np.clip((tcoord - (e + shift) + soft / 2) / soft, 0, 1)
@@ -80,9 +87,11 @@ def edge_sample(soft=0, shift=0, angle=0.0, contrast=0.55, luma_step=0.05,
 
 def gen_samples():
     S = []
-    for soft in (0, 1, 2, 3, 5, 7):
+    # soft=1 is algebraically identical to soft=0 on this sampled ramp, so it
+    # must not be counted as an independent observation.
+    for soft in (0, 2, 3, 5, 7):
         for shift in (0, 0.5, 1, 2, 4):  # luma px; 0.5/1 = sub-chroma-px phase
-            for ang in (0.0, 45.0):
+            for ang in (0.0, 22.5, 45.0):
                 for c in (0.55, 0.20):
                     S.append((f"edge_s{soft}_m{shift}_a{int(ang)}_c{c}",
                               *edge_sample(soft, shift, ang, c)))
@@ -92,13 +101,17 @@ def gen_samples():
     S.append(("isoluminant", Y, (-0.15 + 0.55 * t).astype(np.float32),
               (0.40 - 0.60 * t).astype(np.float32),
               (np.abs(XX - 64) <= 3) & (YY > 6) & (YY < H - 6)))
-    # null-space texture: luma step + alternating texture in the null space of
-    # the 2x box (and triangle, bicubic) degradation; chroma step only.
-    alt = 0.10 * np.where((XX % 2) == 0, 1.0, -1.0)
-    Yn = (0.30 + 0.05 * t + alt).astype(np.float32)
-    S.append(("nullspace", Yn, (-0.15 + 0.55 * t).astype(np.float32),
-              (0.40 - 0.60 * t).astype(np.float32),
-              (np.abs(XX - 64) <= 3) & (YY > 6) & (YY < H - 6)))
+    # Axis/checker Nyquist counterexamples. These are targeted aliases, not a
+    # claim to span the full null space of an unknown encoder.
+    for label, alt in (
+        ("nullspace_x", 0.10 * np.where((XX % 2) == 0, 1.0, -1.0)),
+        ("nullspace_y", 0.10 * np.where((YY % 2) == 0, 1.0, -1.0)),
+        ("nullspace_xy", 0.10 * np.where(((XX + YY) % 2) == 0, 1.0, -1.0)),
+    ):
+        Yn = (0.30 + 0.05 * t + alt).astype(np.float32)
+        S.append((label, Yn, (-0.15 + 0.55 * t).astype(np.float32),
+                  (0.40 - 0.60 * t).astype(np.float32),
+                  (np.abs(XX - 64) <= 3) & (YY > 6) & (YY < H - 6)))
     # ridge line art
     dist = np.abs(XX - 64)
     Yr = np.where(dist <= 1, 0.35, 0.70).astype(np.float32)
@@ -119,17 +132,14 @@ def gen_samples():
 # numpy versions of the degradation + statistics
 # ---------------------------------------------------------------------------
 
-def degrade(clip):
-    return clip.resize.Bilinear(format=F420)
-
-
 def sited_box(Y):
     """Footprint box to the 420 chroma grid (left siting: luma {2cx-1, 2cx})."""
-    P = np.pad(Y, ((1, 1), (1, 1)), mode="edge")
     out = np.zeros((H // 2, W // 2))
     for cy in range(H // 2):
         for cx in range(W // 2):
-            out[cy, cx] = P[2 * cy:2 * cy + 2, 2 * cx:2 * cx + 2].mean()
+            ys = np.clip((2 * cy, 2 * cy + 1), 0, H - 1)
+            xs = np.clip((2 * cx - 1, 2 * cx), 0, W - 1)
+            out[cy, cx] = Y[np.ix_(ys, xs)].mean()
     return out
 
 
@@ -219,231 +229,312 @@ def band_chroma(band):
     b = np.zeros((H // 2, W // 2), bool)
     for cy in range(H // 2):
         for cx in range(W // 2):
-            b[cy, cx] = band[2 * cy - 1:2 * cy + 2, 2 * cx - 1:2 * cx + 2].any()
+            y0, y1 = max(0, 2 * cy - 1), min(H, 2 * cy + 2)
+            x0, x1 = max(0, 2 * cx - 1), min(W, 2 * cx + 2)
+            b[cy, cx] = band[y0:y1, x0:x1].any()
     return b
 
 
 # --- statistic: current in-plugin cedge (max-projection width fade) ---------
 
-def stat_cedge_cur(U, V, nxm, nym, bcm):
+def stat_cedge_proxy(U, V, nxm, nym, bcm):
     ch, cw = U.shape
-    val = np.zeros((ch, cw))
-    for cy in range(ch):
-        for cx in range(cw):
-            x0, x1 = max(0, cx - 3), min(cw, cx + 4)
-            y0, y1 = max(0, cy - 3), min(ch, cy + 4)
-            rc = max(np.ptp(U[y0:y1, x0:x1]), np.ptp(V[y0:y1, x0:x1]))
-            if rc < 1e-6:
-                val[cy, cx] = 1.0
-                continue
-            anx, any_ = abs(nxm[cy, cx]), abs(nym[cy, cx])
-            gmax = 0.0
-            for j in range(y0, y1):
-                for i in range(x0, x1):
-                    i1 = min(i + 1, cw - 1)
-                    j1 = min(j + 1, ch - 1)
-                    gu = max(abs(U[j, i1] - U[j, i]) * anx, abs(U[j1, i] - U[j, i]) * any_)
-                    gv = max(abs(V[j, i1] - V[j, i]) * anx, abs(V[j1, i] - V[j, i]) * any_)
-                    gmax = max(gmax, gu, gv)
-            wc = rc / (gmax + 1e-6)
-            val[cy, cx] = np.clip((2.2 - wc) / 0.7, 0, 1)
-    return val[bcm].mean()
+    vals = []
+    for cy, cx in np.argwhere(bcm):
+        x0, x1 = max(0, cx - 3), min(cw, cx + 4)
+        y0, y1 = max(0, cy - 3), min(ch, cy + 4)
+        rc = max(np.ptp(U[y0:y1, x0:x1]), np.ptp(V[y0:y1, x0:x1]))
+        if rc < 1e-6:
+            vals.append(1.0)  # mirrors the current plugin's pass-through default
+            continue
+        anx, any_ = abs(nxm[cy, cx]), abs(nym[cy, cx])
+        gmax = 0.0
+        for j in range(y0, y1):
+            for i in range(x0, x1):
+                i1 = min(i + 1, cw - 1)
+                j1 = min(j + 1, ch - 1)
+                gu = max(abs(U[j, i1] - U[j, i]) * anx,
+                         abs(U[j1, i] - U[j, i]) * any_)
+                gv = max(abs(V[j, i1] - V[j, i]) * anx,
+                         abs(V[j1, i] - V[j, i]) * any_)
+                gmax = max(gmax, gu, gv)
+        wc = rc / (gmax + 1e-6)
+        vals.append(np.clip((2.2 - wc) / 0.7, 0, 1))
+    return float(np.mean(vals)) if vals else 0.0
 
 
 # --- statistic: rotation-equivariant normal-profile width -------------------
 
 def stat_cedge_eq(U, V, nxm, nym, bcm):
-    ch, cw = U.shape
-    val = np.zeros((ch, cw))
-    cyy, cxx = np.mgrid[0:ch, 0:cw].astype(float)
+    vals = []
     ks = np.arange(-3, 4)
-    for cy in range(ch):
-        for cx in range(cw):
-            if not bcm[cy, cx]:
-                continue
-            nx, ny = nxm[cy, cx], nym[cy, cx]
-            px, py = cx + ks * nx, cy + ks * ny
-            pu = bil(U, px, py)
-            pv = bil(V, px, py)
-            # project onto the dominant chroma-change direction
-            du = pu[-1] - pu[0]
-            dv = pv[-1] - pv[0]
-            nrm = np.hypot(du, dv)
-            if nrm < 1e-6:
-                val[cy, cx] = 1.0
-                continue
-            s = (pu * du + pv * dv) / nrm
-            lo, hi = s.min(), s.max()
-            rng = hi - lo
-            if rng < 1e-6:
-                val[cy, cx] = 1.0
-                continue
-            # 10-90% rise distance along the profile (linear crossings)
-            def crossing(level):
-                for k in range(6):
-                    if (s[k] - level) * (s[k + 1] - level) <= 0 and s[k + 1] != s[k]:
-                        return k + (level - s[k]) / (s[k + 1] - s[k])
-                return None
-            c10 = crossing(lo + 0.1 * rng)
-            c90 = crossing(lo + 0.9 * rng)
-            if c10 is None or c90 is None or c90 <= c10:
-                w = 1.0  # monotonic step within window: hard
-            else:
-                w = c90 - c10
-            val[cy, cx] = np.clip((2.2 - w) / 0.7, 0, 1)
-    return val[bcm].mean() if bcm.any() else 1.0
+    for cy, cx in np.argwhere(bcm):
+        nx, ny = nxm[cy, cx], nym[cy, cx]
+        px, py = cx + ks * nx, cy + ks * ny
+        pu = bil(U, px, py)
+        pv = bil(V, px, py)
+        # Project onto the endpoint chroma-change direction. Equal endpoints
+        # (ridge/nonmonotonic profile) are absence of evidence, not a hard edge.
+        du = pu[-1] - pu[0]
+        dv = pv[-1] - pv[0]
+        nrm = np.hypot(du, dv)
+        if nrm < 1e-6:
+            vals.append(0.0)
+            continue
+        s = (pu * du + pv * dv) / nrm
+        lo, hi = s.min(), s.max()
+        rng = hi - lo
+        total_variation = np.abs(np.diff(s)).sum()
+        if rng < 1e-6 or total_variation < 1e-6:
+            vals.append(0.0)
+            continue
+
+        def crossing(level):
+            for k in range(6):
+                if (s[k] - level) * (s[k + 1] - level) <= 0 and s[k + 1] != s[k]:
+                    return k + (level - s[k]) / (s[k + 1] - s[k])
+            return None
+
+        c10 = crossing(lo + 0.1 * rng)
+        c90 = crossing(lo + 0.9 * rng)
+        if c10 is None or c90 is None or c90 <= c10:
+            vals.append(0.0)
+            continue
+        width_fade = np.clip((2.2 - (c90 - c10)) / 0.7, 0, 1)
+        monotonicity = abs(s[-1] - s[0]) / (total_variation + 1e-12)
+        vals.append(width_fade * np.clip(monotonicity, 0, 1))
+    return float(np.mean(vals)) if vals else 0.0
 
 
 # --- statistic: ms gate (participation width + centroid, mirrors maps.cpp) --
 
-def ms_map(Yc, U, V):
+def ms_map(Yc, U, V, mask=None):
     gx, gy = sobel(Yc)
     ux, uy = sobel(U)
     vx, vy = sobel(V)
     nxm, nym, _ = normals_from(Yc)
     ch, cw = Yc.shape
     gate = np.zeros((ch, cw))
-    cyy, cxx = np.mgrid[0:ch, 0:cw].astype(float)
     ks = np.arange(-3, 4, dtype=float)
-    for cy in range(ch):
-        for cx in range(cw):
-            nx, ny = nxm[cy, cx], nym[cy, cx]
-            px, py = cx + ks * nx, cy + ks * ny
-            gY = np.abs(bil(gx, px, py) * nx + bil(gy, px, py) * ny)
-            au = bil(ux, px, py) * nx + bil(uy, px, py) * ny
-            av = bil(vx, px, py) * nx + bil(vy, px, py) * ny
-            gC = np.sqrt(au * au + av * av)
-            sumY, sumC = gY.sum(), gC.sum()
-            if sumY < 1e-9 or sumC < 1e-9:
-                gate[cy, cx] = 0.0
-                continue
-            partY = sumY * sumY / (gY ** 2).sum()
-            partC = sumC * sumC / (gC ** 2).sum()
-            ratio = partC / partY
-            dcent = abs((ks * gY).sum() / sumY - (ks * gC).sum() / sumC)
-            tw = np.clip((1.6 - ratio) / 0.4, 0, 1)
-            tp = np.clip((1.0 - dcent) / 0.5, 0, 1)
-            gate[cy, cx] = (tw * tw * (3 - 2 * tw)) * (tp * tp * (3 - 2 * tp))
+    coords = np.argwhere(mask) if mask is not None else np.argwhere(np.ones_like(gate, bool))
+    for cy, cx in coords:
+        nx, ny = nxm[cy, cx], nym[cy, cx]
+        px, py = cx + ks * nx, cy + ks * ny
+        gY = np.abs(bil(gx, px, py) * nx + bil(gy, px, py) * ny)
+        au = bil(ux, px, py) * nx + bil(uy, px, py) * ny
+        av = bil(vx, px, py) * nx + bil(vy, px, py) * ny
+        gC = np.sqrt(au * au + av * av)
+        sumY, sumC = gY.sum(), gC.sum()
+        if sumY < 1e-9 or sumC < 1e-9:
+            continue
+        partY = sumY * sumY / (gY ** 2).sum()
+        partC = sumC * sumC / (gC ** 2).sum()
+        ratio = partC / partY
+        dcent = abs((ks * gY).sum() / sumY - (ks * gC).sum() / sumC)
+        tw = np.clip((1.6 - ratio) / 0.4, 0, 1)
+        tp = np.clip((1.0 - dcent) / 0.5, 0, 1)
+        gate[cy, cx] = (tw * tw * (3 - 2 * tw)) * (tp * tp * (3 - 2 * tp))
     return gate
 
 
 # --- statistic: affine credibility q with candidate kernels -----------------
 
-def q_map(Y, U, V, kind, eps=1e-4):
-    Yc = degrade_kernel(Y, kind)
-    ch, cw = Yc.shape
-    q = np.zeros((ch, cw))
-    r = 2
-    for cy in range(ch):
-        for cx in range(cw):
-            y0, y1 = max(0, cy - r), min(ch, cy + r + 1)
-            x0, x1 = max(0, cx - r), min(cw, cx + r + 1)
-            yw = Yc[y0:y1, x0:x1].ravel()
-            uw = U[y0:y1, x0:x1].ravel()
-            vw = V[y0:y1, x0:x1].ravel()
-            vy_ = yw.var()
-            covU = np.cov(yw, uw)[0, 1]
-            covV = np.cov(yw, vw)[0, 1]
-            q[cy, cx] = (covU ** 2 + covV ** 2) / ((vy_ + eps) * (uw.var() + vw.var() + eps))
-    return np.clip(q, 0, 1)
+def local_mean(a, radius=2):
+    """Clipped-window population mean, matching buildAffineMaps()."""
+    h, w = a.shape
+    p = np.pad(a, radius, mode="constant")
+    sums = np.zeros_like(a, dtype=np.float64)
+    counts = np.zeros_like(a, dtype=np.float64)
+    ones = np.pad(np.ones_like(a, dtype=np.float64), radius, mode="constant")
+    for dj in range(2 * radius + 1):
+        for di in range(2 * radius + 1):
+            sums += p[dj:dj + h, di:di + w]
+            counts += ones[dj:dj + h, di:di + w]
+    return sums / counts
+
+
+def q_maps(Y, U, V, eps=0.005 ** 2, eps_sig=(0.25 * 0.01) ** 2):
+    """Return every per-pixel component of the production algo=6 q gate."""
+    mean_u, mean_v = local_mean(U), local_mean(V)
+    var_u = np.maximum(0.0, local_mean(U * U) - mean_u * mean_u)
+    var_v = np.maximum(0.0, local_mean(V * V) - mean_v * mean_v)
+    var_c = var_u + var_v
+
+    candidates = []
+    for kind in ("box", "tri", "bic"):
+        yc = degrade_kernel(Y, kind)
+        mean_y = local_mean(yc)
+        var_y = np.maximum(0.0, local_mean(yc * yc) - mean_y * mean_y)
+        cov_u = local_mean(yc * U) - mean_y * mean_u
+        cov_v = local_mean(yc * V) - mean_y * mean_v
+        q = (cov_u * cov_u + cov_v * cov_v) / ((var_y + eps) * (var_c + eps))
+        candidates.append(np.clip(q, 0, 1))
+
+    stack = np.stack(candidates)
+    q_min = stack.min(axis=0)
+    q_max = stack.max(axis=0)
+    q_mean = stack.mean(axis=0)
+    stability = np.divide(q_min, q_max, out=np.zeros_like(q_min), where=q_max > 1e-9)
+    significance = var_c / (var_c + eps_sig)
+    q_prod = q_mean * stability * significance
+    return {
+        "q_box": candidates[0],
+        "q_tri": candidates[1],
+        "q_bic": candidates[2],
+        "q_min": q_min,
+        "q_mean": q_mean,
+        "stability": stability,
+        "significance": significance,
+        "q_prod": q_prod,
+    }
 
 
 # ---------------------------------------------------------------------------
 # main evaluation
 # ---------------------------------------------------------------------------
 
+def auc_for(rows, score, label):
+    pos = np.asarray([r[score] for r in rows if r[label] < 0])
+    neg = np.asarray([r[score] for r in rows if r[label] > 0])
+    if not len(pos) or not len(neg):
+        return float("nan")
+    return float((pos[:, None] > neg[None, :]).mean()
+                 + 0.5 * (pos[:, None] == neg[None, :]).mean())
+
+
+def coverage_result(rows, score, label, target):
+    values = np.sort([r[score] for r in rows])[::-1]
+    rank = max(1, int(np.ceil(target * len(values)))) - 1
+    threshold = values[rank]
+    accepted = [r for r in rows if r[score] >= threshold]
+    risk = float(np.mean([r[label] for r in accepted]))
+    return len(accepted) / len(rows), risk
+
+
+def report_classifier(rows, label, stats, title, eps=5e-4):
+    labeled = [r for r in rows if abs(r[label]) > eps]
+    pos = sum(r[label] < 0 for r in labeled)
+    neg = sum(r[label] > 0 for r in labeled)
+    print(f"\n--- {title} ---")
+    print(f"{len(rows)} observations, {len(labeled)} labeled "
+          f"({pos} benefit / {neg} harm), {len(rows) - len(labeled)} neutral excluded; "
+          f"mean delta={np.mean([r[label] for r in rows]):+.5f}")
+    print(f"{'statistic':<12} {'AUC':>6}   risk at target coverage "
+          "(target->actual:risk; lower is better)")
+    for score in stats:
+        line = f"{score:<12} {auc_for(labeled, score, label):>6.3f}   "
+        for target in (0.05, 0.10, 0.20, 0.50, 1.0):
+            actual, risk = coverage_result(labeled, score, label, target)
+            line += f"{int(target * 100):>3}%->{actual * 100:>4.1f}%:{risk:+.4f}  "
+        print(line)
+
+    print("per-actual-D AUC:")
+    print(f"{'statistic':<12}" + "".join(f"{kind:>10}" for kind in ("box", "tri", "bic")))
+    for score in stats:
+        line = f"{score:<12}"
+        for kind in ("box", "tri", "bic"):
+            subset = [r for r in labeled if r["actual_d"] == kind]
+            line += f"{auc_for(subset, score, label):>10.3f}"
+        print(line)
+
+
 def main():
     samples = gen_samples()
     rows = []
-    for name, Y, U, V, band in samples:
-        clip = make_clip(Y, U, V)
-        src420 = degrade(clip)
-        fgt = clip.get_frame(0)
-        gtU = np.asarray(fgt[1]).astype(np.float64)
-        gtV = np.asarray(fgt[2]).astype(np.float64)
-        maes = {}
-        for tag, kw in (("plain", dict(strength=0.0)),
-                        ("ungated", dict(strength=0.8, algo=2, ms=0, cedge=0)),
-                        ("algo6_ms0", dict(strength=0.8, algo=6, ms=0)),
-                        ("algo6", dict(strength=0.8, algo=6))):
-            f = core.lgcr.Recon(src420, kernel="jinc", taps=3, **kw).get_frame(0)
-            maes[tag] = (np.abs(np.asarray(f[1]).astype(np.float64) - gtU)[band].mean()
-                         + np.abs(np.asarray(f[2]).astype(np.float64) - gtV)[band].mean()) / 2
-        delta = maes["ungated"] - maes["plain"]
-        delta6 = maes["algo6_ms0"] - maes["plain"]  # detail-transfer label for q/ms
-
-        # statistics from the same planes the plugin sees
-        fs = src420.get_frame(0)
-        U420 = np.asarray(fs[1]).astype(np.float64)
-        V420 = np.asarray(fs[2]).astype(np.float64)
-        Yc = sited_box(Y.astype(np.float64))
-        nxm, nym, _ = normals_from(Yc)
+    actual_kernels = ("box", "tri", "bic")
+    for sample_index, (name, Y, U, V, band) in enumerate(samples, 1):
+        y64 = Y.astype(np.float64)
+        u64 = U.astype(np.float64)
+        v64 = V.astype(np.float64)
+        yc_box = sited_box(y64)
+        nxm, nym, _ = normals_from(yc_box)
         bcm = band_chroma(band)
-        ms = ms_map(Yc, U420, V420)[bcm].mean()
-        qb = q_map(Y.astype(np.float64), U420, V420, "box")[bcm].mean()
-        qt = q_map(Y.astype(np.float64), U420, V420, "tri")[bcm].mean()
-        qc = q_map(Y.astype(np.float64), U420, V420, "bic")[bcm].mean()
-        rows.append(dict(name=name, delta=delta, delta6=delta6,
-                         gain6=maes["algo6"] - maes["plain"],
-                         cedge_cur=stat_cedge_cur(U420, V420, nxm, nym, bcm),
-                         cedge_eq=stat_cedge_eq(U420, V420, nxm, nym, bcm),
-                         ms=ms, q_box=qb, q_tri=qt, q_bic=qc,
-                         q_min=min(qb, qt, qc)))
-        print(f"{name:<26} delta={delta:+.5f} ms={ms:.3f} q_min={rows[-1]['q_min']:.3f}")
 
-    # classifier evaluation
-    eps = 5e-4
-    labeled = [r for r in rows if abs(r["delta"]) > eps]
-    pos = [r for r in labeled if r["delta"] < 0]  # mechanism helps
-    neg = [r for r in labeled if r["delta"] > 0]
-    print(f"\n{len(rows)} samples, {len(labeled)} labeled "
-          f"({len(pos)} benefit / {len(neg)} harm), {len(rows) - len(labeled)} neutral excluded")
+        for actual_d in actual_kernels:
+            u420 = degrade_kernel(u64, actual_d)
+            v420 = degrade_kernel(v64, actual_d)
+            src420 = make_420_clip(Y, u420.astype(np.float32), v420.astype(np.float32))
+            maes = {}
+            for tag, kw in (
+                ("plain", dict(strength=0.0)),
+                ("algo2_ungated", dict(strength=0.8, algo=2, ms=0, cedge=0)),
+                ("algo6_ungated", dict(strength=0.8, algo=6, qgate=0, ms=0)),
+                ("algo6_full", dict(strength=0.8, algo=6, qgate=1, ms=1)),
+            ):
+                f = core.lgcr.Recon(src420, kernel="jinc", taps=3, **kw).get_frame(0)
+                maes[tag] = float((np.abs(np.asarray(f[1]).astype(np.float64) - u64)[band].mean()
+                                   + np.abs(np.asarray(f[2]).astype(np.float64) - v64)[band].mean()) / 2)
 
-    stats = ("cedge_cur", "cedge_eq", "ms", "q_box", "q_min")
-    print(f"\n{'statistic':<10} {'AUC':>6}   risk/coverage (risk = mean signed delta, lower=better)")
-    for s in stats:
-        p = np.array([r[s] for r in pos])
-        n = np.array([r[s] for r in neg])
-        if len(p) and len(n):
-            auc = float((p[:, None] > n[None, :]).mean() + 0.5 * (p[:, None] == n[None, :]).mean())
-        else:
-            auc = float("nan")
-        line = f"{s:<10} {auc:>6.3f}   "
-        for cov in (0.5, 0.75, 1.0):
-            thr = np.sort([r[s] for r in labeled])[::-1]
-            k = max(1, int(round(cov * len(thr)))) - 1
-            t = thr[k]
-            acc = [r for r in labeled if r[s] >= t]
-            risk = np.mean([r["delta"] for r in acc])
-            line += f"cov{int(cov*100)}%:{risk:+.4f}  "
-        print(line)
+            msm = ms_map(yc_box, u420, v420, bcm)
+            qm = q_maps(y64, u420, v420)
+            means = {key: float(value[bcm].mean()) for key, value in qm.items()}
+            rows.append({
+                "name": name,
+                "actual_d": actual_d,
+                "delta2": maes["algo2_ungated"] - maes["plain"],
+                "delta6": maes["algo6_ungated"] - maes["plain"],
+                "gain6": maes["algo6_full"] - maes["plain"],
+                "cedge_proxy": stat_cedge_proxy(u420, v420, nxm, nym, bcm),
+                "width_eq": stat_cedge_eq(u420, v420, nxm, nym, bcm),
+                "ms": float(msm[bcm].mean()),
+                "q_prod_ms": float((qm["q_prod"] * msm)[bcm].mean()),
+                **means,
+            })
+        if sample_index % 25 == 0 or sample_index == len(samples):
+            print(f"[{sample_index:>3}/{len(samples)}] {name}")
 
-    # --- algo=6 label: detail transfer (ms=0) vs plain --------------------
-    # This is the label q was designed for: "does the affine detail transfer
-    # help here". Statistics are scored against it, plus the q x ms composite.
-    print("\n--- label: algo=6 detail transfer (ms=0) vs plain ---")
-    labeled6 = [r for r in rows if abs(r["delta6"]) > eps]
-    pos6 = [r for r in labeled6 if r["delta6"] < 0]
-    neg6 = [r for r in labeled6 if r["delta6"] > 0]
-    print(f"{len(labeled6)} labeled ({len(pos6)} benefit / {len(neg6)} harm); "
-          f"mean delta6 = {np.mean([r['delta6'] for r in rows]):+.5f}, "
-          f"mean algo6(full) delta = {np.mean([r['gain6'] for r in rows]):+.5f}")
-    for r in rows:
-        r["qxms"] = r["q_min"] * r["ms"]
-    for s in ("q_box", "q_min", "ms", "qxms"):
-        p = np.array([r[s] for r in pos6])
-        n = np.array([r[s] for r in neg6])
-        auc = float((p[:, None] > n[None, :]).mean() + 0.5 * (p[:, None] == n[None, :]).mean()) if len(p) and len(n) else float("nan")
-        line = f"{s:<10} {auc:>6.3f}   "
-        for cov in (0.5, 0.75, 1.0):
-            thr = np.sort([r[s] for r in labeled6])[::-1]
-            k = max(1, int(round(cov * len(thr)))) - 1
-            t = thr[k]
-            acc = [r for r in labeled6 if r[s] >= t]
-            risk = np.mean([r["delta6"] for r in acc])
-            line += f"cov{int(cov*100)}%:{risk:+.4f}  "
-        print(line)
+    print(f"\n{len(samples)} unique samples x {len(actual_kernels)} actual degradations "
+          f"= {len(rows)} observations")
+    report_classifier(
+        rows, "delta2", ("cedge_proxy", "width_eq", "ms"),
+        "label: ungated algo=2 mechanism vs plain",
+    )
+    report_classifier(
+        rows, "delta6", ("q_box", "q_min", "q_prod", "ms", "q_prod_ms"),
+        "label: q/ms-independent algo=6 detail transfer vs plain",
+    )
+    print("\nfull algo=6 mean delta vs plain by actual D:")
+    for kind in actual_kernels:
+        vals = [r["gain6"] for r in rows if r["actual_d"] == kind]
+        print(f"  {kind:<4} {np.mean(vals):+.5f}")
+    print(f"  all  {np.mean([r['gain6'] for r in rows]):+.5f}")
+    full_labeled = [r for r in rows if abs(r["gain6"]) > 5e-4]
+    print(f"full algo=6 labeled outcomes: "
+          f"{sum(r['gain6'] < 0 for r in full_labeled)} benefit / "
+          f"{sum(r['gain6'] > 0 for r in full_labeled)} harm / "
+          f"{len(rows) - len(full_labeled)} neutral")
+    print("worst full algo=6 residuals:")
+    for row in sorted(rows, key=lambda r: r["gain6"], reverse=True)[:8]:
+        print(f"  {row['name']:<26} D={row['actual_d']:<3} "
+              f"delta={row['gain6']:+.5f} q*ms={row['q_prod_ms']:.3f}")
+
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
 
 
 if __name__ == "__main__":
-    main()
+    capture = io.StringIO()
+    original_stdout = sys.stdout
+    sys.stdout = Tee(original_stdout, capture)
+    try:
+        main()
+    finally:
+        sys.stdout = original_stdout
+    results_dir = os.path.join(HERE, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    with open(os.path.join(results_dir, "eval_gates_latest.md"), "w") as report:
+        report.write("# LGCR gate evaluation\n\n```text\n")
+        report.write("\n".join(line.rstrip() for line in capture.getvalue().splitlines()))
+        report.write("\n")
+        report.write("```\n")

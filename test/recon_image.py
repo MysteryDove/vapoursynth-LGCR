@@ -9,6 +9,7 @@ The 4:2:0 degradation simulates what a decoder hands the renderer; LGCR then
 rebuilds 4:4:4 chroma guided by luma. RGB<->YUV is BT.601 full-range, done in
 numpy so the roundtrip is self-consistent.
 """
+import os
 import sys
 
 import numpy as np
@@ -18,6 +19,8 @@ import vapoursynth as vs
 
 core = vs.core
 core.num_threads = 8
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
 
 
 def rgb_to_yuv444(arr):
@@ -70,7 +73,7 @@ def main():
     strength = float(sys.argv[4]) if len(sys.argv) > 4 else 0.8
     scale = float(sys.argv[5]) if len(sys.argv) > 5 else 1.0
 
-    core.std.LoadPlugin("/home/owen/dev/bsflab/liblgcr.so")
+    core.std.LoadPlugin(os.environ.get("LGCR_PLUGIN", os.path.join(ROOT, "liblgcr.so")))
 
     src = png_to_clip(inp)
     # degrade to 4:2:0 (this is where chroma bleed/fringing is introduced)

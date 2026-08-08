@@ -13,6 +13,7 @@ OBJS    := $(SRCS:.cpp=.o)
 HDR     := src/lgcr.h
 
 TARGET  := liblgcr.so
+PYTHON  ?= $(HOME)/vapoursynth/bin/python3
 
 all: $(TARGET)
 
@@ -23,7 +24,11 @@ $(TARGET): $(SRCS) $(HDR)
 liblgcr_scalar.so: $(SRCS) $(HDR)
 	$(CXX) -O3 -std=c++17 -fPIC -Wall -Wextra -DLGCR_SUFFIX='"_scalar"' -I$(VSINCLUDE) -shared -o $@ $(SRCS)
 
+check: $(TARGET) liblgcr_scalar.so
+	$(PYTHON) test/test_lgcr.py
+	$(PYTHON) test/test_algo6.py
+
 clean:
 	rm -f $(TARGET) liblgcr_scalar.so src/*.o
 
-.PHONY: all clean
+.PHONY: all check clean
