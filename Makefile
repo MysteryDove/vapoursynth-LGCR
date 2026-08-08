@@ -62,6 +62,9 @@ eval-kernel-confirm: $(TARGET)
 
 eval-kernel-study: eval-kernels eval-kernel-confirm
 
+eval-wada-confirm: $(TARGET)
+	$(PYTHON) -m evaluation.wada_confirm --write-results
+
 eval-corpora:
 	$(PYTHON) -m evaluation.coedge --write-results
 
@@ -74,4 +77,4 @@ asan-check: liblgcr_asan.so
 clean:
 	rm -f $(TARGET) liblgcr_scalar.so liblgcr_asan.so src/*.o
 
-.PHONY: all check paper-check asan-check eval-dev eval-test eval-ablation eval-siting eval-phase eval-kernels eval-kernel-confirm eval-kernel-study eval-corpora eval-results clean
+.PHONY: all check paper-check asan-check eval-dev eval-test eval-ablation eval-siting eval-phase eval-kernels eval-kernel-confirm eval-kernel-study eval-wada-confirm eval-corpora eval-results clean
