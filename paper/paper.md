@@ -39,7 +39,10 @@ bicubic and held-out Lanczos. A siting intervention nearly doubles algo6's
 absolute phase error from 0.350 to 0.692 pixels. These results support an open,
 mechanism-oriented benchmark and a conditional reconstruction tradeoff, not a
 state-of-the-art claim. Real-animation prevalence, codec quantization, and
-subjective benefit remain open evaluation requirements.
+subjective benefit remain open evaluation requirements. In a separately frozen
+supplemental holdout, replacing Jinc3 with a development-selected Lanczos4 base
+improves algo6 edge MAE by 0.000945 (95% CI 0.000733 to 0.001161), while
+slightly increasing tangent alias.
 
 Keywords: chroma upsampling, color bleeding, chroma aliasing, animation,
 4:2:0, chroma siting, guided reconstruction, reproducibility
@@ -358,6 +361,14 @@ protocol are under `evaluation/`. The plugin is a C++17 VapourSynth plugin.
 `make eval-results` regenerates all synthetic results; `make check` runs plugin,
 scalar/AVX2, regression, battery, and metric tests.
 
+The non-Jinc study is supplemental. After the main test results were known, a
+development-only screen selected Lanczos4 by the same edge-MAE endpoint. Its
+comparison against Jinc3 was then frozen before evaluating 64 new scenes
+(seeds 3000 through 3063). The protocol and selection record are in
+`evaluation/kernel_study_protocol.md` and
+`evaluation/kernel_study_config.json`. This repository-local freeze is not an
+external preregistration and cannot alter the main primary analysis.
+
 ## 3. Results
 
 ### 3.1 Held-out comparison
@@ -487,7 +498,36 @@ from 0.027195 to 0.025990, a paired delta of -0.001206 [95% CI -0.001746,
 by construction and the maximum output change is exactly 0. This supports the
 narrow phase mechanism, not an aggregate Jinc benefit.
 
-### 3.6 Real-domain validation status
+### 3.6 Supplemental non-Jinc base-kernel study
+
+A development-only screen compared Bilinear, three bicubic settings, Spline16,
+Spline36, Lanczos2/3/4, and Jinc2/3/4 as signal-only and algo6 bases. Lanczos4
+had the lowest development algo6 edge MAE: 0.023005 versus 0.023963 for Jinc3.
+Lanczos4 was therefore frozen as the sole non-Jinc candidate before a new
+64-scene holdout crossed four degradations with left and center siting.
+
+**Table 6. Frozen supplemental kernel holdout. These rows are not directly
+comparable with Table 1 because they use different scenes.**
+
+| Method | Edge MAE [95% CI] | Bleed profile | Abs. phase px | Alias px | Spread delta px | Ringing |
+|---|---:|---:|---:|---:|---:|---:|
+| Plain Jinc3 | 0.025014 [0.021734, 0.028110] | 0.035844 | 0.067399 | 0.070605 | 1.052517 | 0.005976 |
+| Algo6 Jinc3 | 0.022933 [0.020036, 0.025639] | 0.032929 | 0.081851 | **0.068443** | 0.824147 | 0.006567 |
+| Plain Lanczos4 | 0.023957 [0.020873, 0.026856] | 0.035591 | **0.067291** | 0.074180 | 1.022345 | **0.005092** |
+| Algo6 Lanczos4 | **0.021988 [0.019232, 0.024507]** | **0.032625** | 0.080742 | 0.071482 | **0.802653** | 0.006012 |
+
+The frozen Lanczos4-minus-Jinc3 algo6 edge-MAE difference is -0.000945 [95% CI
+-0.001161, -0.000733], with 81.2% of scenes improved. Against signal-only
+Lanczos4, algo6 improves edge MAE by -0.001969 [95% CI -0.002688, -0.001260].
+The difference from algo6 Jinc3 is neutral under box degradation (+0.000011, CI
+crossing zero), then favors Lanczos4 under triangle (-0.000223), bicubic
+(-0.001614), and Lanczos degradation (-0.001954), with each latter CI excluding
+zero. Lanczos4 also lowers bleed-profile error, phase error, transition spread,
+and ringing relative to algo6 Jinc3, but raises tangent alias from 0.068443 to
+0.071482. This shows that LGCR is not dependent on Jinc and that base-kernel
+choice remains a metric-dependent tradeoff.
+
+### 3.7 Real-domain validation status
 
 The tracked animation and natural-image manifests are empty. Running
 `make eval-corpora` therefore emits `Status: INCOMPLETE` and no domain
@@ -517,6 +557,13 @@ bicubic and unseen Lanczos, together with wins on box and triangle, suggests
 that estimating the source degradation or selecting a method per scene is more
 promising than further tuning one global strength. That selector must be
 evaluated on a new holdout because the interaction was discovered here.
+
+The supplemental kernel holdout adds a narrower answer: Jinc is not required
+by constrained transfer. Lanczos4 improves the primary signal-domain endpoint
+on new synthetic scenes, especially when the forward degradation has bicubic
+or Lanczos-like support. Jinc3 retains lower tangent alias. This is evidence for
+two useful operating points, not for changing the original primary method
+after the fact.
 
 Guide mismatch is equally important. Chroma self-guidance lets EJBF reconstruct
 isoluminant boundaries, while LGCR's luma-first design cannot. Conversely,
@@ -593,8 +640,46 @@ filled, the paper should say "animation-style synthetic content," not
 10. **Non-monotonic ablations.** Rescue, anisotropy, and credibility gating do
     not each improve aggregate Jinc3 results. They must not be presented as
     universally beneficial components.
+11. **Supplemental kernel selection.** Lanczos4 was selected after the main
+    paper results were known, although its 64-scene holdout was frozen and new.
+    The study uses the same generator family and does not rerun Wada EJBF on
+    those scenes.
+12. **Separable forward-model confound.** Every simulated downsampling kernel
+    in the current study is separable. Lanczos4 is also separable, whereas Jinc
+    is radial, so part of Lanczos4's supplemental advantage may reflect
+    forward-model family matching rather than a generally better reconstruction
+    kernel. Radial, anisotropic, and codec-estimated point-spread functions are
+    needed before making a general kernel-ranking claim.
 
-### 4.5 Next evaluation
+### 4.5 Beyond Jinc
+
+There are four increasingly substantive alternatives to a Jinc base. First,
+separable Lanczos4 is already implemented and now has direct supplemental
+evidence; Spline36 and Lanczos3 were the next strongest non-Jinc development
+candidates. Second, EJBF-style self-guided filtering is a different estimator,
+not merely a kernel swap, and remains the strongest external method in the main
+benchmark. Third, the observed degradation interactions motivate a
+degradation-conditioned selector between constrained transfer and EJBF-like
+smoothing. Fourth, an animation-specific inverse model could fit two chroma
+side colors and a monotone boundary profile whose location is guided, but not
+dictated, by luma. That would address bleeding and phase directly rather than
+through a fixed interpolation footprint.
+
+The kernel comparison also has a structural confound: all simulated forward
+degradations are separable, as is Lanczos4, while Jinc is radial. Forward-model
+family matching may therefore contribute to Lanczos4's edge-MAE advantage, and
+Jinc3's lower tangent-alias error is consistent with the isotropy expected of a
+radial kernel. Tests with radial, anisotropic, and codec-estimated point-spread
+functions are required before treating the supplemental result as a general
+kernel ranking.
+
+Learned edge-directed reconstruction, including NNEDI-like or neural joint
+upsampling, is also possible but changes the training-free scope and introduces
+training-data provenance and generalization requirements. It belongs as an
+external comparison or a separate study, not as an unreported replacement for
+the analytic method.
+
+### 4.6 Next evaluation
 
 The next confirmatory study should freeze a licensed 4:4:4 animation corpus, a
 matched natural-image corpus, codec settings, and a new test split before any
@@ -613,12 +698,14 @@ plain Jinc base but loses the primary comparison to Wada EJBF. The ranking then
 reverses across degradation kernels, soft-chroma scenes expose guide risk, and
 incorrect siting nearly doubles phase error. These are useful findings because
 they replace a broad novelty claim with a falsifiable map of when methods work.
+A separate new holdout shows that Lanczos4 is a viable and, for edge MAE,
+stronger algo6 base than Jinc3, while Jinc3 preserves lower tangent alias.
 
 The controlled study is technically ready for a transparent GitHub working-
-paper release, but the repository still needs author, license, and citation
-metadata. It is not ready to claim effectiveness on released animation. That
-claim requires the licensed real-domain and subjective evaluation specified in
-the publication plan.
+paper release, but the repository still needs explicit licenses and a versioned
+archival release. It is not ready to claim effectiveness on released animation.
+That claim requires the licensed real-domain and subjective evaluation
+specified in the publication plan.
 
 ## Reproducibility and Data Availability
 
