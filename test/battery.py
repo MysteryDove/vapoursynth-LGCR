@@ -291,7 +291,7 @@ def run_int8_case():
 def main():
     algos = {"plain": dict(strength=0.0), "algo2": dict(strength=0.8, algo=2)}
     if "--all" in sys.argv:
-        for a in (1, 3, 4, 5):
+        for a in (1, 3, 4, 5, 6):
             algos[f"algo{a}"] = dict(strength=0.8, algo=a)
 
     cases = build_cases()

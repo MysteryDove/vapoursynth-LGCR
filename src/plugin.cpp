@@ -205,7 +205,7 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     GuideMaps gm;
     if (d->strength > 0.0) {
         gm = buildGuideMaps(y, y, cw, ch, rw, rh, d->shiftX, d->shiftY, d->algo == 1);
-        if (d->ms > 0.0 && d->algo >= 2 && d->algo <= 4)
+        if (d->ms > 0.0 && ((d->algo >= 2 && d->algo <= 4) || d->algo == 6))
             gm.ms = buildMutualGate(gm.lc, cb, cr, d->sigma);
     }
 
@@ -272,6 +272,27 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
             const ChromaAxis ay = buildChromaAxis(sh, d->outH, rh, d->shiftY, d);
             blendLGF(cOutU, cOutV, lgf.aU, lgf.bU, lgf.aV, lgf.bV,
                      lgf.confU, lgf.confV, y, ax, ay, cw, ch, float(d->strength));
+        }
+    } else if (d->algo == 6) {
+        // Constrained detail transfer: plain kernel base + g*a*(Y - P(D(Y))).
+        // Low frequency and color reference come from the plain kernel; the
+        // affine model only supplies the detail the plain path lost.
+        plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV);
+        if (d->strength > 0.0) {
+            AffineMaps af = buildAffineMaps(d, y, cb, cr, cw, ch, rw, rh);
+            const ChromaAxis ax = buildChromaAxis(sw, d->outW, rw, d->shiftX, d);
+            const ChromaAxis ay = buildChromaAxis(sh, d->outH, rh, d->shiftY, d);
+            std::vector<uint8_t> mask6;
+            const uint8_t *mp = nullptr;
+            int mw = 0, mh = 0;
+            if (d->sparse) {
+                const int dil = int(std::ceil(d->support * std::max(rw, rh))) + 8;
+                mask6 = buildTrustMask(gm, sw, sh, d->sigma, dil);
+                mp = mask6.data();
+                mw = sw;
+                mh = sh;
+            }
+            detailTransfer(d, cOutU, cOutV, yOut, af, gm, ax, ay, mp, mw, mh);
         }
     } else if (d->strength == 0.0) {
         // Pure kernel A/B reference
@@ -690,8 +711,8 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
         const int64_t a = vsapi->mapGetIntSaturated(in, "algo", 0, &err);
         d->algo = err ? 2 : int(a);
     }
-    if (d->algo < 1 || d->algo > 5) {
-        fail("LGCR: algo must be 1 (v1.2), 2 (v1.3), 3 (LGF), 4 (selector) or 5 (NEDI)");
+    if (d->algo < 1 || d->algo > 6) {
+        fail("LGCR: algo must be 1 (v1.2), 2 (v1.3), 3 (LGF), 4 (selector), 5 (NEDI) or 6 (detail transfer)");
         return;
     }
     if (d->algo == 5 && (d->outW != d->viIn->width || d->outH != d->viIn->height)) {
