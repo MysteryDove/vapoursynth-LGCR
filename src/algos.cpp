@@ -1,8 +1,320 @@
 #include "lgcr.h"
 
+#include <array>
+#include <deque>
+
 namespace lgcr {
 
 // LGF-backed selector / sharpen / temporal support / detail transfer
+
+namespace {
+
+template <size_t N, class Sample, class Consume>
+void forEachWindowSum(int width, int height, int radius,
+                      Sample sample, Consume consume) {
+    using Values = std::array<double, N>;
+    std::vector<Values> columns(static_cast<size_t>(width));
+    const int cachedRowCount = std::max(1, 2 * radius + 2);
+    std::vector<Values> cachedRows(static_cast<size_t>(cachedRowCount) * width);
+    int currentTop = 0;
+    int currentBottom = -1;
+
+    auto addRow = [&](int y) {
+        Values values{};
+        for (int x = 0; x < width; ++x) {
+            values.fill(0.0);
+            sample(x, y, values);
+            cachedRows[size_t(y % cachedRowCount) * width + x] = values;
+            for (size_t k = 0; k < N; ++k)
+                columns[x][k] += values[k];
+        }
+    };
+    auto removeRow = [&](int y) {
+        const Values *values = cachedRows.data() + size_t(y % cachedRowCount) * width;
+        for (int x = 0; x < width; ++x)
+            for (size_t k = 0; k < N; ++k)
+                columns[x][k] -= values[x][k];
+    };
+
+    for (int y = 0; y < height; ++y) {
+        const int top = std::max(0, y - radius);
+        const int bottom = std::min(height - 1, y + radius);
+        while (currentBottom < bottom)
+            addRow(++currentBottom);
+        while (currentTop < top)
+            removeRow(currentTop++);
+
+        Values total{};
+        int right = std::min(width - 1, radius);
+        for (int x = 0; x <= right; ++x)
+            for (size_t k = 0; k < N; ++k)
+                total[k] += columns[x][k];
+
+        for (int x = 0; x < width; ++x) {
+            const int left = std::max(0, x - radius);
+            right = std::min(width - 1, x + radius);
+            const int count = (right - left + 1) * (bottom - top + 1);
+            consume(x, y, count, total);
+            const int remove = x - radius;
+            const int add = x + radius + 1;
+            if (remove >= 0)
+                for (size_t k = 0; k < N; ++k)
+                    total[k] -= columns[remove][k];
+            if (add < width)
+                for (size_t k = 0; k < N; ++k)
+                    total[k] += columns[add][k];
+        }
+    }
+}
+
+template <class Backend>
+void minMax5(const Plane &src, Plane &minimum, Plane &maximum) {
+    Plane horizontalMin(src.w, src.h), horizontalMax(src.w, src.h);
+    for (int y = 0; y < src.h; ++y) {
+        const float *source = src.row(y);
+        float *rowMin = horizontalMin.row(y);
+        float *rowMax = horizontalMax.row(y);
+        int x = 0;
+        for (; x < std::min(2, src.w); ++x) {
+            float lo = source[std::max(0, x - 2)];
+            float hi = lo;
+            for (int dx = -1; dx <= 2; ++dx) {
+                const float value = source[std::clamp(x + dx, 0, src.w - 1)];
+                lo = std::min(lo, value);
+                hi = std::max(hi, value);
+            }
+            rowMin[x] = lo;
+            rowMax[x] = hi;
+        }
+        for (; x + Backend::lanes <= src.w - 2; x += Backend::lanes) {
+            auto lo = Backend::load(source + x - 2);
+            auto hi = lo;
+            for (int dx = -1; dx <= 2; ++dx) {
+                const auto value = Backend::load(source + x + dx);
+                lo = Backend::min(lo, value);
+                hi = Backend::max(hi, value);
+            }
+            Backend::store(rowMin + x, lo);
+            Backend::store(rowMax + x, hi);
+        }
+        for (; x < src.w; ++x) {
+            float lo = source[std::max(0, x - 2)];
+            float hi = lo;
+            for (int dx = -1; dx <= 2; ++dx) {
+                const float value = source[std::clamp(x + dx, 0, src.w - 1)];
+                lo = std::min(lo, value);
+                hi = std::max(hi, value);
+            }
+            rowMin[x] = lo;
+            rowMax[x] = hi;
+        }
+    }
+
+    for (int y = 0; y < src.h; ++y) {
+        float *rowMin = minimum.row(y);
+        float *rowMax = maximum.row(y);
+        int x = 0;
+        for (; x + Backend::lanes <= src.w; x += Backend::lanes) {
+            auto lo = Backend::load(horizontalMin.row(std::max(0, y - 2)) + x);
+            auto hi = Backend::load(horizontalMax.row(std::max(0, y - 2)) + x);
+            for (int dy = -1; dy <= 2; ++dy) {
+                const int sourceY = std::clamp(y + dy, 0, src.h - 1);
+                lo = Backend::min(lo, Backend::load(horizontalMin.row(sourceY) + x));
+                hi = Backend::max(hi, Backend::load(horizontalMax.row(sourceY) + x));
+            }
+            Backend::store(rowMin + x, lo);
+            Backend::store(rowMax + x, hi);
+        }
+        for (; x < src.w; ++x) {
+            float lo = horizontalMin.at(x, y - 2);
+            float hi = horizontalMax.at(x, y - 2);
+            for (int dy = -1; dy <= 2; ++dy) {
+                lo = std::min(lo, horizontalMin.at(x, y + dy));
+                hi = std::max(hi, horizontalMax.at(x, y + dy));
+            }
+            rowMin[x] = lo;
+            rowMax[x] = hi;
+        }
+    }
+}
+
+#ifdef __AVX2__
+template <class Backend>
+void minMax5Pair(const Plane &u, const Plane &v,
+                 Plane &minimumU, Plane &maximumU,
+                 Plane &minimumV, Plane &maximumV) {
+    const int width = u.w, height = u.h;
+    constexpr int ringRows = 5;
+    std::array<std::vector<float>, 4> ring;
+    for (auto &buffer : ring)
+        buffer.resize(size_t(ringRows) * width);
+    std::array<int, ringRows> rowIds{{-1, -1, -1, -1, -1}};
+
+    auto horizontalRow = [&](int sourceY) {
+        const int slot = sourceY % ringRows;
+        if (rowIds[slot] == sourceY)
+            return slot;
+        const float *sourceU = u.row(sourceY), *sourceV = v.row(sourceY);
+        float *loU = ring[0].data() + size_t(slot) * width;
+        float *hiU = ring[1].data() + size_t(slot) * width;
+        float *loV = ring[2].data() + size_t(slot) * width;
+        float *hiV = ring[3].data() + size_t(slot) * width;
+        int x = 0;
+        for (; x < std::min(2, width); ++x) {
+            float ulo = sourceU[std::max(0, x - 2)], uhi = ulo;
+            float vlo = sourceV[std::max(0, x - 2)], vhi = vlo;
+            for (int dx = -1; dx <= 2; ++dx) {
+                const int sx = std::clamp(x + dx, 0, width - 1);
+                ulo = std::min(ulo, sourceU[sx]); uhi = std::max(uhi, sourceU[sx]);
+                vlo = std::min(vlo, sourceV[sx]); vhi = std::max(vhi, sourceV[sx]);
+            }
+            loU[x] = ulo; hiU[x] = uhi; loV[x] = vlo; hiV[x] = vhi;
+        }
+        for (; x + Backend::lanes <= width - 2; x += Backend::lanes) {
+            auto ulo = Backend::load(sourceU + x - 2), uhi = ulo;
+            auto vlo = Backend::load(sourceV + x - 2), vhi = vlo;
+            for (int dx = -1; dx <= 2; ++dx) {
+                const auto uv = Backend::load(sourceU + x + dx);
+                const auto vv = Backend::load(sourceV + x + dx);
+                ulo = Backend::min(ulo, uv); uhi = Backend::max(uhi, uv);
+                vlo = Backend::min(vlo, vv); vhi = Backend::max(vhi, vv);
+            }
+            Backend::store(loU + x, ulo); Backend::store(hiU + x, uhi);
+            Backend::store(loV + x, vlo); Backend::store(hiV + x, vhi);
+        }
+        for (; x < width; ++x) {
+            float ulo = sourceU[std::max(0, x - 2)], uhi = ulo;
+            float vlo = sourceV[std::max(0, x - 2)], vhi = vlo;
+            for (int dx = -1; dx <= 2; ++dx) {
+                const int sx = std::clamp(x + dx, 0, width - 1);
+                ulo = std::min(ulo, sourceU[sx]); uhi = std::max(uhi, sourceU[sx]);
+                vlo = std::min(vlo, sourceV[sx]); vhi = std::max(vhi, sourceV[sx]);
+            }
+            loU[x] = ulo; hiU[x] = uhi; loV[x] = vlo; hiV[x] = vhi;
+        }
+        rowIds[slot] = sourceY;
+        return slot;
+    };
+
+    for (int y = 0; y < height; ++y) {
+        std::array<int, 5> slots;
+        for (int dy = -2; dy <= 2; ++dy)
+            slots[dy + 2] = horizontalRow(std::clamp(y + dy, 0, height - 1));
+        float *outLoU = minimumU.row(y), *outHiU = maximumU.row(y);
+        float *outLoV = minimumV.row(y), *outHiV = maximumV.row(y);
+        int x = 0;
+        for (; x + Backend::lanes <= width; x += Backend::lanes) {
+            auto ulo = Backend::load(ring[0].data() + size_t(slots[0]) * width + x);
+            auto uhi = Backend::load(ring[1].data() + size_t(slots[0]) * width + x);
+            auto vlo = Backend::load(ring[2].data() + size_t(slots[0]) * width + x);
+            auto vhi = Backend::load(ring[3].data() + size_t(slots[0]) * width + x);
+            for (int row = 1; row < 5; ++row) {
+                ulo = Backend::min(ulo, Backend::load(
+                    ring[0].data() + size_t(slots[row]) * width + x));
+                uhi = Backend::max(uhi, Backend::load(
+                    ring[1].data() + size_t(slots[row]) * width + x));
+                vlo = Backend::min(vlo, Backend::load(
+                    ring[2].data() + size_t(slots[row]) * width + x));
+                vhi = Backend::max(vhi, Backend::load(
+                    ring[3].data() + size_t(slots[row]) * width + x));
+            }
+            Backend::store(outLoU + x, ulo); Backend::store(outHiU + x, uhi);
+            Backend::store(outLoV + x, vlo); Backend::store(outHiV + x, vhi);
+        }
+        for (; x < width; ++x) {
+            float ulo = ring[0][size_t(slots[0]) * width + x];
+            float uhi = ring[1][size_t(slots[0]) * width + x];
+            float vlo = ring[2][size_t(slots[0]) * width + x];
+            float vhi = ring[3][size_t(slots[0]) * width + x];
+            for (int row = 1; row < 5; ++row) {
+                ulo = std::min(ulo, ring[0][size_t(slots[row]) * width + x]);
+                uhi = std::max(uhi, ring[1][size_t(slots[row]) * width + x]);
+                vlo = std::min(vlo, ring[2][size_t(slots[row]) * width + x]);
+                vhi = std::max(vhi, ring[3][size_t(slots[row]) * width + x]);
+            }
+            outLoU[x] = ulo; outHiU[x] = uhi; outLoV[x] = vlo; outHiV[x] = vhi;
+        }
+    }
+}
+#endif
+
+void slidingMinMax(const Plane &src, int radius, Plane &minimum, Plane &maximum) {
+    if (radius == 2) {
+        minMax5<NativeBackend>(src, minimum, maximum);
+        return;
+    }
+
+    Plane horizontalMin(src.w, src.h), horizontalMax(src.w, src.h);
+    for (int y = 0; y < src.h; ++y) {
+        std::deque<int> minQueue, maxQueue;
+        int next = 0;
+        const float *row = src.row(y);
+        for (int x = 0; x < src.w; ++x) {
+            const int wantedRight = std::min(src.w - 1, x + radius);
+            while (next <= wantedRight) {
+                while (!minQueue.empty() && row[minQueue.back()] >= row[next])
+                    minQueue.pop_back();
+                while (!maxQueue.empty() && row[maxQueue.back()] <= row[next])
+                    maxQueue.pop_back();
+                minQueue.push_back(next);
+                maxQueue.push_back(next);
+                ++next;
+            }
+            const int wantedLeft = x - radius;
+            while (!minQueue.empty() && minQueue.front() < wantedLeft)
+                minQueue.pop_front();
+            while (!maxQueue.empty() && maxQueue.front() < wantedLeft)
+                maxQueue.pop_front();
+            horizontalMin.row(y)[x] = row[minQueue.front()];
+            horizontalMax.row(y)[x] = row[maxQueue.front()];
+        }
+    }
+
+    for (int x = 0; x < src.w; ++x) {
+        std::deque<int> minQueue, maxQueue;
+        int next = 0;
+        for (int y = 0; y < src.h; ++y) {
+            const int wantedBottom = std::min(src.h - 1, y + radius);
+            while (next <= wantedBottom) {
+                while (!minQueue.empty() &&
+                       horizontalMin.row(minQueue.back())[x] >= horizontalMin.row(next)[x])
+                    minQueue.pop_back();
+                while (!maxQueue.empty() &&
+                       horizontalMax.row(maxQueue.back())[x] <= horizontalMax.row(next)[x])
+                    maxQueue.pop_back();
+                minQueue.push_back(next);
+                maxQueue.push_back(next);
+                ++next;
+            }
+            const int wantedTop = y - radius;
+            while (!minQueue.empty() && minQueue.front() < wantedTop)
+                minQueue.pop_front();
+            while (!maxQueue.empty() && maxQueue.front() < wantedTop)
+                maxQueue.pop_front();
+            minimum.row(y)[x] = horizontalMin.row(minQueue.front())[x];
+            maximum.row(y)[x] = horizontalMax.row(maxQueue.front())[x];
+        }
+    }
+}
+
+Plane pointSampledLuma(const Plane &Y, int cw, int ch, double rw, double rh,
+                       double shiftX, double shiftY) {
+    Plane result(cw, ch);
+    std::vector<float> xPosition(cw), yPosition(ch);
+    for (int x = 0; x < cw; ++x)
+        xPosition[x] = float((x + 0.5) * rw - 0.5 + shiftX);
+    for (int y = 0; y < ch; ++y)
+        yPosition[y] = float((y + 0.5) * rh - 0.5 + shiftY);
+    const BilinAxis xAxis = buildBilinAxis(xPosition, Y.w);
+    const BilinAxis yAxis = buildBilinAxis(yPosition, Y.h);
+    for (int y = 0; y < ch; ++y)
+        for (int x = 0; x < cw; ++x)
+            result.row(y)[x] = bilinearFast(
+                Y, xAxis.i0[x], xAxis.f[x], yAxis.i0[y], yAxis.f[y]);
+    return result;
+}
+
+} // namespace
 
 void buildLGF(const Plane &Y, int cw, int ch, double rw, double rh,
                      double shiftX, double shiftY, const Plane &C, int radius, double eps,
@@ -11,68 +323,120 @@ void buildLGF(const Plane &Y, int cw, int ch, double rw, double rh,
     // the footprint average used by the sim path). The regression needs Y at
     // exactly the position C refers to; a misaligned aperture biases the
     // slope by a * offset * slope, which dominates on gradients.
-    Plane ls(cw, ch);
-    for (int cy = 0; cy < ch; ++cy)
-        for (int cx = 0; cx < cw; ++cx)
-            ls.at(cx, cy) = bilinear(Y, (cx + 0.5) * rw - 0.5 + shiftX,
-                                        (cy + 0.5) * rh - 0.5 + shiftY);
-    for (int y = 0; y < ch; ++y) {
-        for (int x = 0; x < cw; ++x) {
-            double sY = 0, sY2 = 0, sC = 0, sYC = 0;
-            int n = 0;
-            for (int j = std::max(0, y - radius); j <= std::min(ch - 1, y + radius); ++j)
-                for (int i = std::max(0, x - radius); i <= std::min(cw - 1, x + radius); ++i) {
-                    const double ly = ls.at(i, j);
-                    const double cc = C.at(i, j);
-                    sY += ly; sY2 += ly * ly; sC += cc; sYC += ly * cc;
-                    ++n;
-                }
-            const double meanY = sY / n, meanC = sC / n;
-            const double cov = sYC / n - meanY * meanC;
-            const double var = sY2 / n - meanY * meanY;
+    Plane ls = pointSampledLuma(Y, cw, ch, rw, rh, shiftX, shiftY);
+    Plane cmin, cmax;
+    if (cedge) {
+        cmin = Plane(cw, ch);
+        cmax = Plane(cw, ch);
+        slidingMinMax(C, radius, cmin, cmax);
+    }
+
+    forEachWindowSum<4>(cw, ch, radius,
+        [&](int x, int y, std::array<double, 4> &values) {
+            const double ly = ls.row(y)[x];
+            const double cc = C.row(y)[x];
+            values = { ly, ly * ly, cc, ly * cc };
+        },
+        [&](int x, int y, int n, const std::array<double, 4> &sum) {
+            const double meanY = sum[0] / n;
+            const double meanC = sum[2] / n;
+            const double cov = sum[3] / n - meanY * meanC;
+            const double var = sum[1] / n - meanY * meanY;
             const double av = cov / (var + eps);
-            a.at(x, y) = static_cast<float>(av);
-            b.at(x, y) = static_cast<float>(meanC - av * meanY);
-            // regression confidence: no luma variance -> no predictive power
+            a.row(y)[x] = static_cast<float>(av);
+            b.row(y)[x] = static_cast<float>(meanC - av * meanY);
             float cf = static_cast<float>(var / (var + eps));
             if (cedge) {
-                // same chroma-transition-width fade as the sim path
-                float cmin = 1e30f, cmax = -1e30f;
-                for (int j = std::max(0, y - radius); j <= std::min(ch - 1, y + radius); ++j)
-                    for (int i = std::max(0, x - radius); i <= std::min(cw - 1, x + radius); ++i) {
-                        cmin = std::min(cmin, C.at(i, j));
-                        cmax = std::max(cmax, C.at(i, j));
-                    }
                 const float lgx = (ls.at(x + 1, y) - ls.at(x - 1, y)) * 0.5f;
                 const float lgy = (ls.at(x, y + 1) - ls.at(x, y - 1)) * 0.5f;
                 const float gl = std::hypot(lgx, lgy);
-                if (gl > 1e-9f && cmax - cmin > 1e-6f) {
+                const float range = cmax.row(y)[x] - cmin.row(y)[x];
+                if (gl > 1e-9f && range > 1e-6f) {
                     const float cgx = (C.at(x + 1, y) - C.at(x - 1, y)) * 0.5f;
                     const float cgy = (C.at(x, y + 1) - C.at(x, y - 1)) * 0.5f;
                     const float gradN = std::fabs(cgx * lgx / gl + cgy * lgy / gl);
-                    const float wc = (cmax - cmin) / (gradN + 1e-6f);
+                    const float wc = range / (gradN + 1e-6f);
                     cf *= std::clamp((2.2f - wc) / 0.7f, 0.0f, 1.0f);
                 }
             }
-            conf.at(x, y) = cf;
-        }
+            conf.row(y)[x] = cf;
+        });
+}
+
+void buildLGFPair(const Plane &Y, int cw, int ch, double rw, double rh,
+                  double shiftX, double shiftY, const Plane &U, const Plane &V,
+                  int radius, double eps,
+                  Plane &aU, Plane &bU, Plane &confU,
+                  Plane &aV, Plane &bV, Plane &confV, bool cedge) {
+    Plane ls = pointSampledLuma(Y, cw, ch, rw, rh, shiftX, shiftY);
+    Plane minU, maxU, minV, maxV;
+    if (cedge) {
+        minU = Plane(cw, ch); maxU = Plane(cw, ch);
+        minV = Plane(cw, ch); maxV = Plane(cw, ch);
+        slidingMinMax(U, radius, minU, maxU);
+        slidingMinMax(V, radius, minV, maxV);
     }
+
+    forEachWindowSum<6>(cw, ch, radius,
+        [&](int x, int y, std::array<double, 6> &values) {
+            const double ly = ls.row(y)[x];
+            const double u = U.row(y)[x], v = V.row(y)[x];
+            values = { ly, ly * ly, u, ly * u, v, ly * v };
+        },
+        [&](int x, int y, int n, const std::array<double, 6> &sum) {
+            const double meanY = sum[0] / n;
+            const double var = sum[1] / n - meanY * meanY;
+            const double meanU = sum[2] / n, meanV = sum[4] / n;
+            const double slopeU = (sum[3] / n - meanY * meanU) / (var + eps);
+            const double slopeV = (sum[5] / n - meanY * meanV) / (var + eps);
+            aU.row(y)[x] = static_cast<float>(slopeU);
+            bU.row(y)[x] = static_cast<float>(meanU - slopeU * meanY);
+            aV.row(y)[x] = static_cast<float>(slopeV);
+            bV.row(y)[x] = static_cast<float>(meanV - slopeV * meanY);
+            float baseConfidence = static_cast<float>(var / (var + eps));
+            float confidenceU = baseConfidence, confidenceV = baseConfidence;
+
+            if (cedge) {
+                const float lgx = (ls.at(x + 1, y) - ls.at(x - 1, y)) * 0.5f;
+                const float lgy = (ls.at(x, y + 1) - ls.at(x, y - 1)) * 0.5f;
+                const float gl = std::hypot(lgx, lgy);
+                auto fade = [&](const Plane &C, const Plane &minimum,
+                                const Plane &maximum) {
+                    const float range = maximum.row(y)[x] - minimum.row(y)[x];
+                    if (gl <= 1e-9f || range <= 1e-6f)
+                        return 1.0f;
+                    const float cgx = (C.at(x + 1, y) - C.at(x - 1, y)) * 0.5f;
+                    const float cgy = (C.at(x, y + 1) - C.at(x, y - 1)) * 0.5f;
+                    const float gradN = std::fabs(cgx * lgx / gl + cgy * lgy / gl);
+                    const float width = range / (gradN + 1e-6f);
+                    return std::clamp((2.2f - width) / 0.7f, 0.0f, 1.0f);
+                };
+                confidenceU *= fade(U, minU, maxU);
+                confidenceV *= fade(V, minV, maxV);
+            }
+            confU.row(y)[x] = confidenceU;
+            confV.row(y)[x] = confidenceV;
+        });
 }
 
 // algo=4: per-pixel mechanism selector.
 //   out = plain + lam * (w2 * (guided - plain) + w3 * conf * (lgf - plain))
 // w2/w3 come from the guided pass (hard-edge-ness x axis/diagonal split).
-void blendSelector(Plane &outU, Plane &outV,
+template <class Backend>
+void blendSelectorImpl(Plane &outU, Plane &outV,
                           const Plane &gU, const Plane &gV,
                           const Plane &aU, const Plane &bU, const Plane &aV, const Plane &bV,
                           const Plane &confU, const Plane &confV, const Plane &Y,
                           const ChromaAxis &ax, const ChromaAxis &ay,
                           const Plane &w2, const Plane &w3,
                           int cw, int ch, float lam) {
-    const BilinAxis bcx = buildBilinAxis(ax.pos, cw);
-    const BilinAxis bcy = buildBilinAxis(ay.pos, ch);
-    const BilinAxis blx = buildBilinAxis(ax.lpos, Y.w);
-    const BilinAxis bly = buildBilinAxis(ay.lpos, Y.h);
+    [[maybe_unused]] constexpr int lanes = Backend::lanes;
+    (void)cw;
+    (void)ch;
+    const BilinAxis &bcx = ax.chromaBilin;
+    const BilinAxis &bcy = ay.chromaBilin;
+    const BilinAxis &blx = ax.lumaBilin;
+    const BilinAxis &bly = ay.lumaBilin;
     for (int oy = 0; oy < outU.h; ++oy) {
         float *ru = outU.row(oy);
         float *rv = outV.row(oy);
@@ -100,6 +464,18 @@ void blendSelector(Plane &outU, Plane &outV,
             rv[ox] += w2v * (gvr[ox] - rv[ox]) + w3v * cv * (av * L0 + bv - rv[ox]);
         }
     }
+}
+
+void blendSelector(Plane &outU, Plane &outV,
+                   const Plane &gU, const Plane &gV,
+                   const Plane &aU, const Plane &bU, const Plane &aV, const Plane &bV,
+                   const Plane &confU, const Plane &confV, const Plane &Y,
+                   const ChromaAxis &ax, const ChromaAxis &ay,
+                   const Plane &w2, const Plane &w3,
+                   int cw, int ch, float lam) {
+    blendSelectorImpl<NativeBackend>(outU, outV, gU, gV, aU, bU, aV, bV,
+                                     confU, confV, Y, ax, ay, w2, w3,
+                                     cw, ch, lam);
 }
 
 void sharpenPlane(Plane &p, const Plane *guideLc, const Plane &guideY,
@@ -324,8 +700,146 @@ static float median3(float a, float b, float c) {
     return a + b + c - std::min({a, b, c}) - std::max({a, b, c});
 }
 
-static Plane suppressSourceNyquist(const Plane &src, double rw, double rh) {
-    Plane cur = src;
+#ifdef __AVX2__
+void affineFixed5Avx2(const Plane &cb, const Plane &cr,
+                      const std::array<Plane, 3> &yc, double eps, double epsSig,
+                      AffineMaps &m) {
+    constexpr int momentCount = 16;
+    constexpr int ringRows = 5;
+    const int width = cb.w, height = cb.h;
+    std::vector<double> columns(size_t(momentCount) * width, 0.0);
+    std::vector<double> ring(size_t(momentCount) * ringRows * width);
+    int currentTop = 0, currentBottom = -1;
+
+    auto ringPlane = [&](int moment, int row) {
+        return ring.data() + (size_t(moment) * ringRows + row % ringRows) * width;
+    };
+    auto column = [&](int moment) {
+        return columns.data() + size_t(moment) * width;
+    };
+    auto addRow = [&](int y) {
+        for (int x = 0; x < width; ++x) {
+            const double u = cb.row(y)[x], v = cr.row(y)[x];
+            ringPlane(0, y)[x] = u; ringPlane(1, y)[x] = u * u;
+            ringPlane(2, y)[x] = v; ringPlane(3, y)[x] = v * v;
+            for (int k = 0; k < 3; ++k) {
+                const double ly = yc[k].row(y)[x];
+                const int base = 4 + 4 * k;
+                ringPlane(base, y)[x] = ly;
+                ringPlane(base + 1, y)[x] = ly * ly;
+                ringPlane(base + 2, y)[x] = ly * u;
+                ringPlane(base + 3, y)[x] = ly * v;
+            }
+            m.degradedLuma.row(y)[x] = median3(
+                yc[0].row(y)[x], yc[1].row(y)[x], yc[2].row(y)[x]);
+        }
+        for (int k = 0; k < momentCount; ++k) {
+            double *dst = column(k);
+            const double *src = ringPlane(k, y);
+            int x = 0;
+            for (; x + 4 <= width; x += 4)
+                _mm256_storeu_pd(dst + x, _mm256_add_pd(
+                    _mm256_loadu_pd(dst + x), _mm256_loadu_pd(src + x)));
+            for (; x < width; ++x)
+                dst[x] += src[x];
+        }
+    };
+    auto removeRow = [&](int y) {
+        for (int k = 0; k < momentCount; ++k) {
+            double *dst = column(k);
+            const double *src = ringPlane(k, y);
+            int x = 0;
+            for (; x + 4 <= width; x += 4)
+                _mm256_storeu_pd(dst + x, _mm256_sub_pd(
+                    _mm256_loadu_pd(dst + x), _mm256_loadu_pd(src + x)));
+            for (; x < width; ++x)
+                dst[x] -= src[x];
+        }
+    };
+
+    auto consume = [&](int x, int y, int count, const double *sum) {
+        const double inverseCount = 1.0 / count;
+        const double meanU = sum[0] * inverseCount;
+        const double meanV = sum[2] * inverseCount;
+        const double varU = std::max(0.0, sum[1] * inverseCount - meanU * meanU);
+        const double varV = std::max(0.0, sum[3] * inverseCount - meanV * meanV);
+        const float rangeU = m.mxU.row(y)[x] - m.mnU.row(y)[x];
+        const float rangeV = m.mxV.row(y)[x] - m.mnV.row(y)[x];
+        m.rng.row(y)[x] = std::max(rangeU, rangeV);
+
+        double qk[3], aUk[3], aVk[3];
+        for (int k = 0; k < 3; ++k) {
+            const int base = 4 + 4 * k;
+            const double meanY = sum[base] * inverseCount;
+            const double varY = std::max(
+                0.0, sum[base + 1] * inverseCount - meanY * meanY);
+            const double covU = sum[base + 2] * inverseCount - meanY * meanU;
+            const double covV = sum[base + 3] * inverseCount - meanY * meanV;
+            aUk[k] = std::clamp(covU / (varY + eps), -16.0, 16.0);
+            aVk[k] = std::clamp(covV / (varY + eps), -16.0, 16.0);
+            qk[k] = std::clamp((covU * covU + covV * covV) /
+                                   ((varY + eps) * (varU + varV + eps)),
+                               0.0, 1.0);
+        }
+        const double qsum = qk[0] + qk[1] + qk[2];
+        const double qmax = std::max({qk[0], qk[1], qk[2]});
+        const double qmin = std::min({qk[0], qk[1], qk[2]});
+        m.aU.row(y)[x] = median3(float(aUk[0]), float(aUk[1]), float(aUk[2]));
+        m.aV.row(y)[x] = median3(float(aVk[0]), float(aVk[1]), float(aVk[2]));
+        const double stability = qmax > 1e-9 ? qmin / qmax : 0.0;
+        const double chromaSignal = (varU + varV) / (varU + varV + epsSig);
+        m.g.row(y)[x] = float((qsum / 3.0) * stability * chromaSignal);
+    };
+
+    for (int y = 0; y < height; ++y) {
+        const int top = std::max(0, y - 2);
+        const int bottom = std::min(height - 1, y + 2);
+        while (currentTop < top)
+            removeRow(currentTop++);
+        while (currentBottom < bottom)
+            addRow(++currentBottom);
+        const int verticalCount = bottom - top + 1;
+
+        alignas(32) double sums[momentCount][4];
+        int x = 0;
+        for (; x < std::min(2, width); ++x) {
+            double one[momentCount]{};
+            for (int sx = 0; sx <= std::min(width - 1, x + 2); ++sx)
+                for (int k = 0; k < momentCount; ++k)
+                    one[k] += column(k)[sx];
+            consume(x, y, (std::min(width - 1, x + 2) + 1) * verticalCount, one);
+        }
+        for (; x + 3 <= width - 3; x += 4) {
+            for (int k = 0; k < momentCount; ++k) {
+                const double *c = column(k) + x;
+                __m256d value = _mm256_add_pd(
+                    _mm256_loadu_pd(c - 2), _mm256_loadu_pd(c - 1));
+                value = _mm256_add_pd(value, _mm256_loadu_pd(c));
+                value = _mm256_add_pd(value, _mm256_loadu_pd(c + 1));
+                value = _mm256_add_pd(value, _mm256_loadu_pd(c + 2));
+                _mm256_store_pd(sums[k], value);
+            }
+            for (int lane = 0; lane < 4; ++lane) {
+                double one[momentCount];
+                for (int k = 0; k < momentCount; ++k)
+                    one[k] = sums[k][lane];
+                consume(x + lane, y, 5 * verticalCount, one);
+            }
+        }
+        for (; x < width; ++x) {
+            double one[momentCount]{};
+            const int left = std::max(0, x - 2);
+            const int right = std::min(width - 1, x + 2);
+            for (int sx = left; sx <= right; ++sx)
+                for (int k = 0; k < momentCount; ++k)
+                    one[k] += column(k)[sx];
+            consume(x, y, (right - left + 1) * verticalCount, one);
+        }
+    }
+}
+#endif
+
+static Plane suppressSourceNyquist(Plane cur, double rw, double rh) {
     auto levelsFor = [](double ratio) {
         int levels = 0;
         while (ratio > 1.5 && levels < 4) {
@@ -334,47 +848,50 @@ static Plane suppressSourceNyquist(const Plane &src, double rw, double rh) {
         }
         return levels;
     };
-    for (int pass = 0; pass < levelsFor(rw); ++pass) {
+    const int xLevels = levelsFor(rw);
+    const int yLevels = levelsFor(rh);
+    if (xLevels == 0 && yLevels == 0)
+        return cur;
+
+    Plane next(cur.w, cur.h);
+    for (int pass = 0; pass < xLevels; ++pass) {
         const int step = 1 << pass;
-        Plane next(cur.w, cur.h);
         for (int y = 0; y < cur.h; ++y)
             for (int x = 0; x < cur.w; ++x)
                 next.at(x, y) = 0.25f * cur.at(x - step, y) + 0.5f * cur.at(x, y)
                               + 0.25f * cur.at(x + step, y);
-        cur = std::move(next);
+        std::swap(cur.px, next.px);
     }
-    for (int pass = 0; pass < levelsFor(rh); ++pass) {
+    for (int pass = 0; pass < yLevels; ++pass) {
         const int step = 1 << pass;
-        Plane next(cur.w, cur.h);
         for (int y = 0; y < cur.h; ++y)
             for (int x = 0; x < cur.w; ++x)
                 next.at(x, y) = 0.25f * cur.at(x, y - step) + 0.5f * cur.at(x, y)
                               + 0.25f * cur.at(x, y + step);
-        cur = std::move(next);
+        std::swap(cur.px, next.px);
     }
     return cur;
 }
 
-static Plane resampleDetailToOutput(const Plane &src, const LGCRData &d) {
+static Plane resampleDetailToOutput(Plane src, const LGCRData &d) {
     if (src.w == d.outW && src.h == d.outH)
         return src;
     Plane out(d.outW, d.outH);
     if (d.radial) {
         resampleRadial(src, out, d);
     } else {
-        const WeightTable th = buildWeights(src.w, d.outW, d.kernel, d.kp1, d.kp2,
-                                            d.support, 0.0);
-        const WeightTable tv = buildWeights(src.h, d.outH, d.kernel, d.kp1, d.kp2,
-                                            d.support, 0.0);
+        const auto th = cachedWeights(&d, src.w, d.outW, 0.0);
+        const auto tv = cachedWeights(&d, src.h, d.outH, 0.0);
         Plane tmp(d.outW, src.h);
-        resampleH(src, tmp, th);
-        resampleV(tmp, out, tv);
+        resampleH(src, tmp, *th);
+        resampleV(tmp, out, *tv);
     }
     return out;
 }
 
 AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
-                           const Plane &cr, int cw, int ch, double rw, double rh) {
+                           const Plane &cr, int cw, int ch, double rw, double rh,
+                           PipelineMetrics *metrics) {
     AffineMaps m;
     m.aU = Plane(cw, ch);
     m.aV = Plane(cw, ch);
@@ -388,46 +905,75 @@ AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
     const double eps = d->reg * d->reg;
     const double epsSig = (0.25 * d->sigma) * (0.25 * d->sigma);
     // Candidate encoder degradations (unknown D: accept only stable conclusions)
-    const Plane yc[3] = { buildYcMap(y, cw, ch, rw, rh, d->shiftX, d->shiftY, 0),
-                          buildYcMap(y, cw, ch, rw, rh, d->shiftX, d->shiftY, 1),
-                          buildYcMap(y, cw, ch, rw, rh, d->shiftX, d->shiftY, 2) };
+    const std::array<Plane, 3> yc = buildYcMaps(
+        d, y, cw, ch, rw, rh, d->shiftX, d->shiftY, metrics);
     const int r = 2;
-    for (int cy = 0; cy < ch; ++cy) {
-        for (int cx = 0; cx < cw; ++cx) {
-            const int x0 = std::max(0, cx - r), x1 = std::min(cw - 1, cx + r);
-            const int y0 = std::max(0, cy - r), y1 = std::min(ch - 1, cy + r);
-            // chroma window moments (kernel-independent)
-            double sU = 0, sU2 = 0, sV = 0, sV2 = 0;
-            float mnU = 1e30f, mxU = -1e30f, mnV = 1e30f, mxV = -1e30f;
-            int n = 0;
-            for (int j = y0; j <= y1; ++j)
-                for (int i = x0; i <= x1; ++i) {
-                    const double u = cb.at(i, j), v = cr.at(i, j);
-                    sU += u; sU2 += u * u; sV += v; sV2 += v * v;
-                    mnU = std::min(mnU, float(u)); mxU = std::max(mxU, float(u));
-                    mnV = std::min(mnV, float(v)); mxV = std::max(mxV, float(v));
-                    ++n;
-                }
-            const double varU = std::max(0.0, sU2 / n - (sU / n) * (sU / n));
-            const double varV = std::max(0.0, sV2 / n - (sV / n) * (sV / n));
-            m.mnU.at(cx, cy) = mnU; m.mxU.at(cx, cy) = mxU;
-            m.mnV.at(cx, cy) = mnV; m.mxV.at(cx, cy) = mxV;
-            m.rng.at(cx, cy) = std::max(mxU - mnU, mxV - mnV);
+#ifdef __AVX2__
+    {
+        const auto start = std::chrono::steady_clock::now();
+        minMax5Pair<NativeBackend>(cb, cr, m.mnU, m.mxU, m.mnV, m.mxV);
+        if (metrics) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            metrics->add(CpuProfileSlot::AffineMinMaxU, uint64_t(elapsed / 2));
+            metrics->add(CpuProfileSlot::AffineMinMaxV,
+                         uint64_t(elapsed - elapsed / 2));
+        }
+    }
+#else
+    {
+        ScopedCpuTimer timer(metrics, CpuProfileSlot::AffineMinMaxU);
+        slidingMinMax(cb, r, m.mnU, m.mxU);
+    }
+    {
+        ScopedCpuTimer timer(metrics, CpuProfileSlot::AffineMinMaxV);
+        slidingMinMax(cr, r, m.mnV, m.mxV);
+    }
+#endif
+    m.degradedLuma = Plane(cw, ch);
+
+    // U/V moments and all three degradation candidates share one rolling
+    // window traversal. Working storage is O(width), not O(frame size).
+    bool specialized = false;
+#ifdef __AVX2__
+    if (cw >= 8) {
+        ScopedCpuTimer timer(metrics, CpuProfileSlot::AffineWindowMoments);
+        affineFixed5Avx2(cb, cr, yc, eps, epsSig, m);
+        specialized = true;
+    }
+#endif
+    if (!specialized) {
+        ScopedCpuTimer timer(metrics, CpuProfileSlot::AffineWindowMoments);
+        forEachWindowSum<16>(cw, ch, r,
+        [&](int x, int py, std::array<double, 16> &values) {
+            const double u = cb.row(py)[x], v = cr.row(py)[x];
+            values[0] = u; values[1] = u * u;
+            values[2] = v; values[3] = v * v;
+            for (int k = 0; k < 3; ++k) {
+                const double ly = yc[k].row(py)[x];
+                const int base = 4 + 4 * k;
+                values[base] = ly;
+                values[base + 1] = ly * ly;
+                values[base + 2] = ly * u;
+                values[base + 3] = ly * v;
+            }
+        },
+        [&](int cx, int cy, int n, const std::array<double, 16> &sum) {
+            const double meanU = sum[0] / n, meanV = sum[2] / n;
+            const double varU = std::max(0.0, sum[1] / n - meanU * meanU);
+            const double varV = std::max(0.0, sum[3] / n - meanV * meanV);
+            const float rangeU = m.mxU.row(cy)[cx] - m.mnU.row(cy)[cx];
+            const float rangeV = m.mxV.row(cy)[cx] - m.mnV.row(cy)[cx];
+            m.rng.row(cy)[cx] = std::max(rangeU, rangeV);
 
             double qk[3], aUk[3], aVk[3];
             for (int k = 0; k < 3; ++k) {
-                double sY = 0, sY2 = 0, sYU = 0, sYV = 0;
-                for (int j = y0; j <= y1; ++j)
-                    for (int i = x0; i <= x1; ++i) {
-                        const double ly = yc[k].at(i, j);
-                        sY += ly; sY2 += ly * ly;
-                        sYU += ly * cb.at(i, j);
-                        sYV += ly * cr.at(i, j);
-                    }
-                const double meanY = sY / n;
-                const double varY = std::max(0.0, sY2 / n - meanY * meanY);
-                const double covU = sYU / n - meanY * (sU / n);
-                const double covV = sYV / n - meanY * (sV / n);
+                const int base = 4 + 4 * k;
+                const double meanY = sum[base] / n;
+                const double varY = std::max(
+                    0.0, sum[base + 1] / n - meanY * meanY);
+                const double covU = sum[base + 2] / n - meanY * meanU;
+                const double covV = sum[base + 3] / n - meanY * meanV;
                 aUk[k] = std::clamp(covU / (varY + eps), -16.0, 16.0);
                 aVk[k] = std::clamp(covV / (varY + eps), -16.0, 16.0);
                 qk[k] = std::clamp((covU * covU + covV * covV) /
@@ -437,54 +983,57 @@ AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
             const double qsum = qk[0] + qk[1] + qk[2];
             const double qmax = std::max({qk[0], qk[1], qk[2]});
             const double qmin = std::min({qk[0], qk[1], qk[2]});
-            // Keep the correction estimator independent of q so q can be
-            // evaluated as a gate without generating its own labels.
-            m.aU.at(cx, cy) = median3(float(aUk[0]), float(aUk[1]), float(aUk[2]));
-            m.aV.at(cx, cy) = median3(float(aVk[0]), float(aVk[1]), float(aVk[2]));
+            m.aU.row(cy)[cx] = median3(float(aUk[0]), float(aUk[1]), float(aUk[2]));
+            m.aV.row(cy)[cx] = median3(float(aVk[0]), float(aVk[1]), float(aVk[2]));
             const double qMean = qsum / 3.0;
-            const double stab = qmax > 1e-9 ? qmin / qmax : 0.0; // multi-kernel agreement
-            const double sigC = (varU + varV) / (varU + varV + epsSig);
-            m.g.at(cx, cy) = float(qMean * stab * sigC);
-        }
+            const double stability = qmax > 1e-9 ? qmin / qmax : 0.0;
+            const double chromaSignal = (varU + varV) / (varU + varV + epsSig);
+            m.g.row(cy)[cx] = float(qMean * stability * chromaSignal);
+            });
     }
     // Build a kernel-independent matched guide by taking the per-sample median
     // of the candidate degradations. q/stability decide whether to trust the
     // resulting correction, but do not choose its direction or base signal.
-    Plane ycConsensus(cw, ch);
-    for (int cy = 0; cy < ch; ++cy)
-        for (int cx = 0; cx < cw; ++cx)
-            ycConsensus.at(cx, cy) = median3(yc[0].at(cx, cy), yc[1].at(cx, cy),
-                                              yc[2].at(cx, cy));
-
-    // Reconstruct matched luma to the SOURCE luma grid first. The unobservable
-    // frequency locations are defined on this grid and must not move when the
-    // user requests a different output size.
-    GuideMaps gmEmpty; // plain path never reads guide maps
-    LGCRData sourceD = *d;
-    sourceD.outW = y.w;
-    sourceD.outH = y.h;
-    Plane ybSource(y.w, y.h), dummy(y.w, y.h);
-    plainChroma(&sourceD, ycConsensus, ycConsensus, y, gmEmpty,
-                y.w, y.h, cw, ch, ybSource, dummy);
-    Plane sourceDetail(y.w, y.h);
-    for (int py = 0; py < y.h; ++py)
-        for (int px = 0; px < y.w; ++px)
-            sourceDetail.at(px, py) = y.at(px, py) - ybSource.at(px, py);
-    sourceDetail = suppressSourceNyquist(sourceDetail, rw, rh);
-    m.detail = resampleDetailToOutput(sourceDetail, *d);
+    if (!specialized) {
+        ScopedCpuTimer timer(metrics, CpuProfileSlot::AffineFinalizeMedian);
+        for (int cy = 0; cy < ch; ++cy)
+            for (int cx = 0; cx < cw; ++cx)
+                m.degradedLuma.row(cy)[cx] = median3(
+                    yc[0].row(cy)[cx], yc[1].row(cy)[cx], yc[2].row(cy)[cx]);
+    }
     return m;
 }
 
-void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
-                    const AffineMaps &af, const GuideMaps &gm,
-                    const ChromaAxis &ax, const ChromaAxis &ay,
-                    const uint8_t *mask, int maskW, int maskH) {
+void buildDetailMap(const LGCRData *d, const Plane &y, int cw, int ch,
+                    double rw, double rh, AffineMaps &m) {
+    // Reconstruct matched luma to the SOURCE luma grid first. The unobservable
+    // frequency locations are defined on this grid and must not move when the
+    // user requests a different output size.
+    LGCRData sourceD = *d;
+    sourceD.outW = y.w;
+    sourceD.outH = y.h;
+    Plane sourceDetail(y.w, y.h);
+    plainPlane(&sourceD, m.degradedLuma, y.w, y.h, cw, ch, sourceDetail);
+    for (int py = 0; py < y.h; ++py)
+        for (int px = 0; px < y.w; ++px)
+            sourceDetail.at(px, py) = y.at(px, py) - sourceDetail.at(px, py);
+    sourceDetail = suppressSourceNyquist(std::move(sourceDetail), rw, rh);
+    m.detail = resampleDetailToOutput(std::move(sourceDetail), *d);
+    m.degradedLuma = Plane();
+}
+
+template <class Backend>
+void detailTransferImpl(const LGCRData *d, Plane &outU, Plane &outV,
+                        const AffineMaps &af, const GuideMaps &gm,
+                        const ChromaAxis &ax, const ChromaAxis &ay,
+                        const uint8_t *mask, int maskW, int maskH) {
+    [[maybe_unused]] constexpr int lanes = Backend::lanes;
     const int ow = outU.w, oh = outU.h;
     const Plane &dl = af.detail;
-    const BilinAxis bcx = buildBilinAxis(ax.pos, af.g.w);
-    const BilinAxis bcy = buildBilinAxis(ay.pos, af.g.h);
-    const BilinAxis blx = buildBilinAxis(ax.lpos, gm.jxx.w);
-    const BilinAxis bly = buildBilinAxis(ay.lpos, gm.jxx.h);
+    const BilinAxis &bcx = ax.chromaBilin;
+    const BilinAxis &bcy = ay.chromaBilin;
+    const BilinAxis &blx = ax.lumaBilin;
+    const BilinAxis &bly = ay.lumaBilin;
     const bool useMs = d->ms > 0.0 && gm.ms.w > 0;
     const float msStrength = float(d->ms);
     const float qStrength = float(d->qgate);
@@ -492,15 +1041,35 @@ void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
     const float ar = float(std::max(0.0, d->arMargin));
     const bool clampHull = d->arMargin >= 0.0;
 
+    const bool directMask = mask && maskW == ow && maskH == oh;
+    std::vector<int> maskX;
+    if (mask && !directMask) {
+        maskX.resize(ow);
+        for (int ox = 0; ox < ow; ++ox)
+            maskX[ox] = std::min(maskW - 1, int(int64_t(ox) * maskW / ow));
+    }
+
     for (int oy = 0; oy < oh; ++oy) {
         float *ru = outU.row(oy);
         float *rv = outV.row(oy);
         const int cyi = bcy.i0[oy], lyi = bly.i0[oy];
         const float cyf = bcy.f[oy], lyf = bly.f[oy];
+        const uint8_t *maskRow = nullptr;
+        if (mask) {
+            const int my = directMask ? oy
+                : std::min(maskH - 1, int(int64_t(oy) * maskH / oh));
+            maskRow = mask + size_t(my) * maskW;
+        }
         for (int ox = 0; ox < ow; ++ox) {
-            if (mask && !mask[size_t(std::min(maskH - 1, oy * maskH / oh)) * maskW
-                              + std::min(maskW - 1, ox * maskW / ow)])
+            if (maskRow && maskRow[directMask ? ox : maskX[ox]] == 0)
                 continue;
+            const float jxx = bilinearFast(
+                gm.jxx, blx.i0[ox], blx.f[ox], lyi, lyf);
+            const float jxy = bilinearFast(
+                gm.jxy, blx.i0[ox], blx.f[ox], lyi, lyf);
+            const float jyy = bilinearFast(
+                gm.jyy, blx.i0[ox], blx.f[ox], lyi, lyf);
+            const TensorDirection direction = principalTensorDirection(jxx, jxy, jyy);
             const int cxi = bcx.i0[ox];
             const float cxf = bcx.f[ox];
             const float q = bilinearFast(af.g, cxi, cxf, cyi, cyf);
@@ -511,18 +1080,11 @@ void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
             }
             const float au = bilinearFast(af.aU, cxi, cxf, cyi, cyf);
             const float av = bilinearFast(af.aV, cxi, cxf, cyi, cyf);
-            // Edge normal/coherence from the luma tensor (source-space probe)
-            const float jxx = bilinearFast(gm.jxx, blx.i0[ox], blx.f[ox], lyi, lyf);
-            const float jxy = bilinearFast(gm.jxy, blx.i0[ox], blx.f[ox], lyi, lyf);
-            const float jyy = bilinearFast(gm.jyy, blx.i0[ox], blx.f[ox], lyi, lyf);
-            const float jdiff = jxx - jyy, jsum = jxx + jyy;
-            const float coherence = std::sqrt(jdiff * jdiff + 4.0f * jxy * jxy) / (jsum + 1e-12f);
-            const float theta = 0.5f * std::atan2(2.0f * jxy, jdiff);
-            // tangent = (-sin, cos)... normal n=(cos,sin); tangent t=(-ny,nx)
-            const float tx = -std::sin(theta), ty = std::cos(theta);
+            const float coherence = direction.coherence;
+            const float tx = -direction.ny, ty = direction.nx;
             // 1D restriction: attenuate detail along the edge tangent before
             // it can be injected into chroma.
-            const float dc = dl.at(ox, oy);
+            const float dc = dl.row(oy)[ox];
             const float s = 1.0f + float(d->stretch) * coherence;
             const float dtp = bilinear(dl, ox + tx * s, oy + ty * s);
             const float dtm = bilinear(dl, ox - tx * s, oy - ty * s);
@@ -547,6 +1109,14 @@ void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
             rv[ox] = ov;
         }
     }
+}
+
+void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
+                    const AffineMaps &af, const GuideMaps &gm,
+                    const ChromaAxis &ax, const ChromaAxis &ay,
+                    const uint8_t *mask, int maskW, int maskH) {
+    detailTransferImpl<NativeBackend>(d, outU, outV, af, gm, ax, ay,
+                                      mask, maskW, maskH);
 }
 
 } // namespace lgcr

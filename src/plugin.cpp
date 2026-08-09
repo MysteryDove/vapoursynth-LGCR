@@ -1,5 +1,7 @@
 #include "lgcr.h"
 
+#include <cstdlib>
+
 using namespace lgcr;
 
 static const VSFrame *VS_CC sharpenGetFrame(int n, int activationReason, void *instanceData,
@@ -106,6 +108,73 @@ static void VS_CC sharpenCreate(const VSMap *in, VSMap *out, void *, VSCore *cor
 // VapourSynth glue
 // ---------------------------------------------------------------------------
 
+static bool profilingEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("LGCR_PROFILE");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+static void writeProfile(VSFrame *frame, const PipelineMetrics &metrics,
+                         uint64_t totalNs, const VSAPI *vsapi) {
+    VSMap *props = vsapi->getFramePropertiesRW(frame);
+    for (size_t i = 0; i < stageCount; ++i) {
+        const Stage stage = static_cast<Stage>(i);
+        const std::string key = "_LGCR_" + std::string(stageName(stage)) + "_us";
+        vsapi->mapSetFloat(props, key.c_str(), metrics.nanoseconds[i] / 1000.0, maReplace);
+        const std::string pixelKey = "_LGCR_" + std::string(stageName(stage)) + "_pixels";
+        const std::string tapKey = "_LGCR_" + std::string(stageName(stage)) + "_taps";
+        vsapi->mapSetInt(props, pixelKey.c_str(), static_cast<int64_t>(metrics.pixels[i]),
+                         maReplace);
+        vsapi->mapSetInt(props, tapKey.c_str(), static_cast<int64_t>(metrics.taps[i]),
+                         maReplace);
+    }
+    for (size_t i = 0; i < cpuProfileSlotCount; ++i) {
+        const auto slot = static_cast<CpuProfileSlot>(i);
+        const std::string key = "_LGCR_cpu_" +
+            std::string(cpuProfileSlotName(slot)) + "_us";
+        vsapi->mapSetFloat(props, key.c_str(),
+                           metrics.cpuNanoseconds[i] / 1000.0, maReplace);
+    }
+    vsapi->mapSetFloat(props, "_LGCR_total_us", totalNs / 1000.0, maReplace);
+    vsapi->mapSetInt(props, "_LGCR_output_pixels",
+                     static_cast<int64_t>(metrics.outputPixels), maReplace);
+    vsapi->mapSetInt(props, "_LGCR_taps_visited",
+                     static_cast<int64_t>(metrics.tapsVisited), maReplace);
+    const double active = metrics.sparseTotalPixels
+        ? double(metrics.sparseActivePixels) / metrics.sparseTotalPixels : 1.0;
+    vsapi->mapSetFloat(props, "_LGCR_sparse_active_ratio", active, maReplace);
+}
+
+static std::vector<uint8_t> projectTrustMaskToChroma(
+    const std::vector<uint8_t> &mask, int maskW, int maskH,
+    int outW, int outH, const ChromaAxis &ax, const ChromaAxis &ay,
+    int chromaW, int chromaH) {
+    std::vector<uint8_t> active(size_t(chromaW) * chromaH, 0);
+    std::vector<int> maskX(outW);
+    for (int ox = 0; ox < outW; ++ox)
+        maskX[ox] = std::min(maskW - 1, int(int64_t(ox) * maskW / outW));
+
+    for (int oy = 0; oy < outH; ++oy) {
+        const int my = std::min(maskH - 1, int(int64_t(oy) * maskH / outH));
+        const uint8_t *maskRow = mask.data() + size_t(my) * maskW;
+        const int cy0 = ay.chromaBilin.i0[oy];
+        const int cy1 = std::min(cy0 + 1, chromaH - 1);
+        uint8_t *active0 = active.data() + size_t(cy0) * chromaW;
+        uint8_t *active1 = active.data() + size_t(cy1) * chromaW;
+        for (int ox = 0; ox < outW; ++ox) {
+            if (maskRow[maskX[ox]] == 0)
+                continue;
+            const int cx0 = ax.chromaBilin.i0[ox];
+            const int cx1 = std::min(cx0 + 1, chromaW - 1);
+            active0[cx0] = active0[cx1] = 1;
+            active1[cx0] = active1[cx1] = 1;
+        }
+    }
+    return active;
+}
+
 static void applyFrameChromaSiting(LGCRData &d, const VSVideoFormat *fmt,
                                    const VSFrame *frame, const VSAPI *vsapi) {
     if (fmt->subSamplingW == 0)
@@ -137,6 +206,11 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     if (activationReason != arAllFramesReady)
         return nullptr;
 
+    const bool profile = profilingEnabled();
+    PipelineMetrics frameMetrics;
+    PipelineMetrics *metrics = profile ? &frameMetrics : nullptr;
+    const auto frameStart = std::chrono::steady_clock::now();
+
     const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
     const VSVideoFormat *fmt = vsapi->getVideoFrameFormat(src);
 
@@ -160,19 +234,25 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     const double cOffset = isFloat ? 0.0 : -0.5; // int chroma: 0.5 neutral -> 0
 
     Plane y(sw, sh), cb(cw, ch), cr(cw, ch);
-    if (isFloat) {
-        planeToFloat<float>(vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0), y, sw, sh, 1.0, 0.0);
-        planeToFloat<float>(vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1), cb, cw, ch, 1.0, 0.0);
-        planeToFloat<float>(vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2), cr, cw, ch, 1.0, 0.0);
-    } else if (fmt->bytesPerSample == 1) {
-        planeToFloat<uint8_t>(vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0), y, sw, sh, yScale, 0.0);
-        planeToFloat<uint8_t>(vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1), cb, cw, ch, yScale, cOffset);
-        planeToFloat<uint8_t>(vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2), cr, cw, ch, yScale, cOffset);
-    } else {
-        planeToFloat<uint16_t>(vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0), y, sw, sh, yScale, 0.0);
-        planeToFloat<uint16_t>(vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1), cb, cw, ch, yScale, cOffset);
-        planeToFloat<uint16_t>(vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2), cr, cw, ch, yScale, cOffset);
+    {
+        ScopedStageTimer timer(metrics, Stage::ConvertInput);
+        if (isFloat) {
+            planeToFloat<float>(vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0), y, sw, sh, 1.0, 0.0);
+            planeToFloat<float>(vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1), cb, cw, ch, 1.0, 0.0);
+            planeToFloat<float>(vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2), cr, cw, ch, 1.0, 0.0);
+        } else if (fmt->bytesPerSample == 1) {
+            planeToFloat<uint8_t>(vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0), y, sw, sh, yScale, 0.0);
+            planeToFloat<uint8_t>(vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1), cb, cw, ch, yScale, cOffset);
+            planeToFloat<uint8_t>(vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2), cr, cw, ch, yScale, cOffset);
+        } else {
+            planeToFloat<uint16_t>(vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0), y, sw, sh, yScale, 0.0);
+            planeToFloat<uint16_t>(vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1), cb, cw, ch, yScale, cOffset);
+            planeToFloat<uint16_t>(vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2), cr, cw, ch, yScale, cOffset);
+        }
     }
+    if (metrics)
+        metrics->addWork(Stage::ConvertInput,
+                         uint64_t(sw) * sh + 2 * uint64_t(cw) * ch);
 
     const double rw = double(sw) / cw;
     const double rh = double(sh) / ch;
@@ -184,39 +264,88 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
 
     // Luma: same size -> verbatim copy (a same-size jinc pass would LOW-PASS:
     // jinc(1)=0.18 != 0); scaled -> separable kernel or true 2D radial.
-    Plane yOut(d->outW, d->outH);
     {
-        if (d->outW == sw && d->outH == sh) {
-            yOut = y;
-        } else if (d->radial) {
-            resampleRadial(y, yOut, *d);
-        } else {
-            WeightTable th = buildWeights(sw, d->outW, d->kernel, d->kp1, d->kp2, d->support, 0.0);
-            WeightTable tv = buildWeights(sh, d->outH, d->kernel, d->kp1, d->kp2, d->support, 0.0);
-            Plane tmp(d->outW, sh);
-            resampleH(y, tmp, th);
-            resampleV(tmp, yOut, tv);
+        Plane yOut;
+        const Plane *outputY = &y;
+        {
+            ScopedStageTimer timer(metrics, Stage::ResampleLuma);
+            if (d->outW != sw || d->outH != sh) {
+                yOut = Plane(d->outW, d->outH);
+                outputY = &yOut;
+            }
+            if (outputY != &y && d->radial) {
+                resampleRadial(y, yOut, *d);
+            } else if (outputY != &y) {
+                const auto th = cachedWeights(d, sw, d->outW, 0.0);
+                const auto tv = cachedWeights(d, sh, d->outH, 0.0);
+                Plane tmp(d->outW, sh);
+                resampleH(y, tmp, *th);
+                resampleV(tmp, yOut, *tv);
+            }
         }
+        if (metrics)
+            metrics->addWork(Stage::ResampleLuma, uint64_t(d->outW) * d->outH);
 
-        if (isFloat)
-            floatToPlane<float>(yOut, vsapi->getWritePtr(dst, 0), vsapi->getStride(dst, 0),
-                                d->outW, d->outH, 1.0, 0.0, -1e30f, 1e30f);
-        else if (fmt->bytesPerSample == 1)
-            floatToPlane<uint8_t>(yOut, vsapi->getWritePtr(dst, 0), vsapi->getStride(dst, 0),
-                                  d->outW, d->outH, double((1 << fmt->bitsPerSample) - 1), 0.0, 0, 255);
-        else
-            floatToPlane<uint16_t>(yOut, vsapi->getWritePtr(dst, 0), vsapi->getStride(dst, 0),
-                                   d->outW, d->outH, double((1 << fmt->bitsPerSample) - 1), 0.0,
-                                   0, uint16_t((1 << fmt->bitsPerSample) - 1));
+        {
+            ScopedStageTimer timer(metrics, Stage::ConvertOutput);
+            if (isFloat)
+                floatToPlane<float>(*outputY, vsapi->getWritePtr(dst, 0), vsapi->getStride(dst, 0),
+                                    d->outW, d->outH, 1.0, 0.0, -1e30f, 1e30f);
+            else if (fmt->bytesPerSample == 1)
+                floatToPlane<uint8_t>(*outputY, vsapi->getWritePtr(dst, 0), vsapi->getStride(dst, 0),
+                                      d->outW, d->outH, double((1 << fmt->bitsPerSample) - 1), 0.0, 0, 255);
+            else
+                floatToPlane<uint16_t>(*outputY, vsapi->getWritePtr(dst, 0), vsapi->getStride(dst, 0),
+                                       d->outW, d->outH, double((1 << fmt->bitsPerSample) - 1), 0.0,
+                                       0, uint16_t((1 << fmt->bitsPerSample) - 1));
+        }
     }
 
     // Guide maps from the SOURCE luma (see recon.cpp for why output-space
     // was tried and rejected); Lc footprint also from the source plane.
     GuideMaps gm;
+    std::vector<uint8_t> trustMask;
     if (d->strength > 0.0) {
-        gm = buildGuideMaps(y, y, cw, ch, rw, rh, d->shiftX, d->shiftY);
-        if (d->ms > 0.0)
-            gm.ms = buildMutualGate(gm.lc, cb, cr, d->sigma);
+        {
+            ScopedStageTimer timer(metrics, Stage::BuildGuideMaps);
+            gm = buildGuideMaps(y, y, cw, ch, rw, rh, d->shiftX, d->shiftY,
+                                metrics);
+        }
+        if (metrics)
+            metrics->addWork(Stage::BuildGuideMaps,
+                             uint64_t(sw) * sh + uint64_t(cw) * ch);
+        if (d->sparse) {
+            const int dil = int(std::ceil(d->support * std::max(rw, rh))) + 8;
+            const double threshold = d->algo == 4 ? 0.25 * d->sigma : d->sigma;
+            {
+                ScopedStageTimer timer(metrics, Stage::BuildTrustMask);
+                trustMask = buildTrustMask(gm, sw, sh, threshold, dil);
+            }
+            if (metrics) {
+                metrics->addWork(Stage::BuildTrustMask, uint64_t(sw) * sh);
+                metrics->sparseTotalPixels += trustMask.size();
+                metrics->sparseActivePixels += static_cast<uint64_t>(
+                    std::count(trustMask.begin(), trustMask.end(), uint8_t{1}));
+            }
+        }
+        uint64_t mutualPixels = uint64_t(cw) * ch;
+        if (d->ms > 0.0) {
+            ScopedStageTimer timer(metrics, Stage::BuildMutualGate);
+            std::vector<uint8_t> mutualMask;
+            if (!trustMask.empty()) {
+                const auto ax = cachedChromaAxis(d, sw, d->outW, rw, d->shiftX);
+                const auto ay = cachedChromaAxis(d, sh, d->outH, rh, d->shiftY);
+                mutualMask = projectTrustMaskToChroma(
+                    trustMask, sw, sh, d->outW, d->outH, *ax, *ay, cw, ch);
+                mutualPixels = static_cast<uint64_t>(
+                    std::count(mutualMask.begin(), mutualMask.end(), uint8_t{1}));
+            }
+            gm.ms = buildMutualGate(gm.lc, cb, cr, d->sigma,
+                                    mutualMask.empty() ? nullptr : mutualMask.data(), cw);
+        }
+        if (metrics && d->ms > 0.0)
+            metrics->addWork(Stage::BuildMutualGate, mutualPixels,
+                             mutualPixels * 7 * 6);
     }
 
     // Chroma: guided reconstruction (output 444 grid == output luma grid).
@@ -226,23 +355,18 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     if (d->algo == 4) {
         // Selector: plain base + per-pixel routing between the sim path
         // (axis-aligned hard edges) and the LGF path (diagonal hard edges)
-        plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV);
+        {
+            ScopedStageTimer timer(metrics, Stage::BuildBaseChroma);
+            plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV, metrics);
+        }
         if (d->strength > 0.0) {
-            LGCRData d4 = *d;
-            d4.algo = 2;
-            d4.strength = 1.0; // fades still apply; lam applied once in blend
-            Plane gU(d->outW, d->outH), gV(d->outW, d->outH);
-            Plane w2(d->outW, d->outH), w3(d->outW, d->outH);
-            ChromaJob job;
-            job.srcU = &cb; job.srcV = &cr; job.srcY = &y; job.gm = &gm;
-            job.dstU = &gU; job.dstV = &gV;
-            job.srcLumaW = sw; job.srcLumaH = sh;
-            job.rw = rw; job.rh = rh; job.shiftX = d->shiftX; job.shiftY = d->shiftY;
-            job.d = &d4;
-            job.selW2 = &w2;
-            job.selW3 = &w3;
-            reconstructChroma(job);
-            LGFMaps lgf = buildLGFMaps(d, y, cb, cr, cw, ch, rw, rh);
+            LGFMaps lgf;
+            {
+                ScopedStageTimer timer(metrics, Stage::BuildLGF);
+                lgf = buildLGFMaps(d, y, cb, cr, cw, ch, rw, rh);
+            }
+            if (metrics)
+                metrics->addWork(Stage::BuildLGF, uint64_t(cw) * ch);
             if (gm.ms.w > 0) // co-edge gate applies to the LGF branch too
                 for (int j = 0; j < ch; ++j)
                     for (int i = 0; i < cw; ++i) {
@@ -250,44 +374,84 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
                         lgf.confU.at(i, j) *= f;
                         lgf.confV.at(i, j) *= f;
                     }
-            const ChromaAxis ax = buildChromaAxis(sw, d->outW, rw, d->shiftX, d);
-            const ChromaAxis ay = buildChromaAxis(sh, d->outH, rh, d->shiftY, d);
-            blendSelector(cOutU, cOutV, gU, gV, lgf.aU, lgf.bU, lgf.aV, lgf.bV,
-                          lgf.confU, lgf.confV, y, ax, ay, w2, w3, cw, ch,
-                          float(d->strength));
+
+            LGCRData d4 = *d;
+            d4.algo = 2;
+            d4.strength = 1.0; // fades still apply; lam applied once in blend
+            ChromaJob job;
+            job.srcU = &cb; job.srcV = &cr; job.srcY = &y; job.gm = &gm;
+            job.dstU = &cOutU; job.dstV = &cOutV;
+            job.srcLumaW = sw; job.srcLumaH = sh;
+            job.rw = rw; job.rh = rh; job.shiftX = d->shiftX; job.shiftY = d->shiftY;
+            job.d = &d4;
+            job.selectorMaps = &lgf;
+            job.selectorStrength = float(d->strength);
+            job.plainU = &cOutU;
+            job.plainV = &cOutV;
+            job.metrics = metrics;
+            if (!trustMask.empty()) {
+                job.mask = trustMask.data();
+                job.maskW = sw;
+                job.maskH = sh;
+            }
+            {
+                ScopedStageTimer timer(metrics, Stage::ApplyGuidedCorrection);
+                reconstructChroma(job);
+            }
+            if (metrics)
+                metrics->addWork(Stage::ApplySelector, uint64_t(d->outW) * d->outH);
         }
     } else if (d->algo == 6) {
         // Constrained detail transfer: plain kernel base + g*a*(Y - P(D(Y))).
         // Low frequency and color reference come from the plain kernel; the
         // affine model only supplies the detail the plain path lost.
-        plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV);
+        {
+            ScopedStageTimer timer(metrics, Stage::BuildBaseChroma);
+            plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV, metrics);
+        }
         if (d->strength > 0.0) {
-            AffineMaps af = buildAffineMaps(d, y, cb, cr, cw, ch, rw, rh);
-            const ChromaAxis ax = buildChromaAxis(sw, d->outW, rw, d->shiftX, d);
-            const ChromaAxis ay = buildChromaAxis(sh, d->outH, rh, d->shiftY, d);
-            std::vector<uint8_t> mask6;
+            AffineMaps af;
+            {
+                ScopedStageTimer timer(metrics, Stage::BuildAffineMaps);
+                af = buildAffineMaps(d, y, cb, cr, cw, ch, rw, rh, metrics);
+            }
+            if (metrics)
+                metrics->addWork(Stage::BuildAffineMaps, uint64_t(cw) * ch);
+            {
+                ScopedStageTimer timer(metrics, Stage::BuildDetail);
+                buildDetailMap(d, y, cw, ch, rw, rh, af);
+            }
+            if (metrics)
+                metrics->addWork(Stage::BuildDetail, uint64_t(d->outW) * d->outH);
+            const auto ax = cachedChromaAxis(d, sw, d->outW, rw, d->shiftX);
+            const auto ay = cachedChromaAxis(d, sh, d->outH, rh, d->shiftY);
             const uint8_t *mp = nullptr;
             int mw = 0, mh = 0;
-            if (d->sparse) {
-                const int dil = int(std::ceil(d->support * std::max(rw, rh))) + 8;
-                mask6 = buildTrustMask(gm, sw, sh, d->sigma, dil);
-                mp = mask6.data();
+            if (!trustMask.empty()) {
+                mp = trustMask.data();
                 mw = sw;
                 mh = sh;
             }
-            detailTransfer(d, cOutU, cOutV, af, gm, ax, ay, mp, mw, mh);
+            {
+                ScopedStageTimer timer(metrics, Stage::ApplyDetailTransfer);
+                detailTransfer(d, cOutU, cOutV, af, gm, *ax, *ay, mp, mw, mh);
+            }
+            if (metrics)
+                metrics->addWork(Stage::ApplyDetailTransfer,
+                                 uint64_t(d->outW) * d->outH);
         }
     } else if (d->strength == 0.0) {
         // Pure kernel A/B reference
-        plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV);
+        ScopedStageTimer timer(metrics, Stage::BuildBaseChroma);
+        plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV, metrics);
     } else {
         // algo=2 guided path. Sparse mode: plain kernel everywhere, guided
         // correction only where luma structure makes it worthwhile.
-        std::vector<uint8_t> mask;
-        if (d->sparse) {
-            const int dil = int(std::ceil(d->support * std::max(rw, rh))) + 8;
-            mask = buildTrustMask(gm, sw, sh, d->sigma, dil); // source luma res
-            plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV);
+        if (!trustMask.empty()) {
+            {
+                ScopedStageTimer timer(metrics, Stage::BuildBaseChroma);
+                plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV, metrics);
+            }
         }
         ChromaJob job;
         job.srcU = &cb;
@@ -303,36 +467,54 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
         job.shiftX = d->shiftX;
         job.shiftY = d->shiftY;
         job.d = d;
-        if (!mask.empty()) {
-            job.mask = mask.data();
+        job.metrics = metrics;
+        if (!trustMask.empty()) {
+            job.mask = trustMask.data();
             job.maskW = sw;
             job.maskH = sh;
             job.plainU = &cOutU;
             job.plainV = &cOutV;
         }
-        reconstructChroma(job);
+        {
+            ScopedStageTimer timer(metrics, Stage::ApplyGuidedCorrection);
+            reconstructChroma(job);
+        }
     }
     // Back-projection data consistency: re-downsample the reconstruction and
     // return a fraction of the residual, D_h(C + delta) ~= C_src.
     if (d->bp > 0.0 && d->outW == sw && d->outH == sh && cw * 2 == sw && ch * 2 == sh) {
+        ScopedStageTimer timer(metrics, Stage::BackProject);
         backProject(cOutU, cb, float(d->bp));
         backProject(cOutV, cr, float(d->bp));
+        if (metrics)
+            metrics->addWork(Stage::BackProject, 2 * uint64_t(cw) * ch, 8 * uint64_t(cw) * ch);
     }
 
-    for (int p = 0; p < 2; ++p) {
-        const Plane &cOut = (p == 0) ? cOutU : cOutV;
-        const double outScale = isFloat ? 1.0 : double((1 << fmt->bitsPerSample) - 1);
-        const double outOffset = isFloat ? 0.0 : 0.5 * outScale; // zero-centered -> neutral
-        if (isFloat)
-            floatToPlane<float>(cOut, vsapi->getWritePtr(dst, p + 1), vsapi->getStride(dst, p + 1),
-                                d->outW, d->outH, 1.0, 0.0, -1e30f, 1e30f);
-        else if (fmt->bytesPerSample == 1)
-            floatToPlane<uint8_t>(cOut, vsapi->getWritePtr(dst, p + 1), vsapi->getStride(dst, p + 1),
-                                  d->outW, d->outH, outScale, outOffset, 0, 255);
-        else
-            floatToPlane<uint16_t>(cOut, vsapi->getWritePtr(dst, p + 1), vsapi->getStride(dst, p + 1),
-                                   d->outW, d->outH, outScale, outOffset,
-                                   0, uint16_t((1 << fmt->bitsPerSample) - 1));
+    {
+        ScopedStageTimer timer(metrics, Stage::ConvertOutput);
+        for (int p = 0; p < 2; ++p) {
+            const Plane &cOut = (p == 0) ? cOutU : cOutV;
+            const double outScale = isFloat ? 1.0 : double((1 << fmt->bitsPerSample) - 1);
+            const double outOffset = isFloat ? 0.0 : 0.5 * outScale; // zero-centered -> neutral
+            if (isFloat)
+                floatToPlane<float>(cOut, vsapi->getWritePtr(dst, p + 1), vsapi->getStride(dst, p + 1),
+                                    d->outW, d->outH, 1.0, 0.0, -1e30f, 1e30f);
+            else if (fmt->bytesPerSample == 1)
+                floatToPlane<uint8_t>(cOut, vsapi->getWritePtr(dst, p + 1), vsapi->getStride(dst, p + 1),
+                                      d->outW, d->outH, outScale, outOffset, 0, 255);
+            else
+                floatToPlane<uint16_t>(cOut, vsapi->getWritePtr(dst, p + 1), vsapi->getStride(dst, p + 1),
+                                       d->outW, d->outH, outScale, outOffset,
+                                       0, uint16_t((1 << fmt->bitsPerSample) - 1));
+        }
+    }
+    if (metrics)
+        metrics->addWork(Stage::ConvertOutput, 3 * uint64_t(d->outW) * d->outH);
+
+    if (metrics) {
+        const auto totalNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - frameStart).count();
+        writeProfile(dst, *metrics, static_cast<uint64_t>(totalNs), vsapi);
     }
 
     vsapi->freeFrame(src);

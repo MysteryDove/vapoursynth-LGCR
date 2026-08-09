@@ -4,7 +4,15 @@ namespace lgcr {
 
 // guided chroma reconstruction + plain base
 
-void reconstructChroma(const ChromaJob &job) {
+#ifdef __AVX2__
+static inline __m256i activeLaneMask(int count) {
+    return _mm256_cmpgt_epi32(_mm256_set1_epi32(count),
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+}
+#endif
+
+template <class Backend>
+void reconstructChromaImpl(const ChromaJob &job) {
     const LGCRData &d = *job.d;
     const Plane &U = *job.srcU;
     const Plane &V = *job.srcV;
@@ -12,8 +20,10 @@ void reconstructChroma(const ChromaJob &job) {
     Plane &outU = *job.dstU;
     Plane &outV = *job.dstV;
 
-    const ChromaAxis ax = buildChromaAxis(job.srcLumaW, outU.w, job.rw, job.shiftX, &d);
-    const ChromaAxis ay = buildChromaAxis(job.srcLumaH, outU.h, job.rh, job.shiftY, &d);
+    const auto axOwner = cachedChromaAxis(&d, job.srcLumaW, outU.w, job.rw, job.shiftX);
+    const auto ayOwner = cachedChromaAxis(&d, job.srcLumaH, outU.h, job.rh, job.shiftY);
+    const ChromaAxis &ax = *axOwner;
+    const ChromaAxis &ay = *ayOwner;
 
     const bool guided = d.strength > 0.0;
     // Guide in SOURCE space: L0 and the structure probes use the sharp source
@@ -23,12 +33,16 @@ void reconstructChroma(const ChromaJob &job) {
     // reference weakened the snap (upscale2x 0.032 -> 0.044). At same size
     // the two are identical anyway.
     const Plane &oY = *job.srcY;
-    const BilinAxis bx = guided ? buildBilinAxis(ax.lpos, oY.w) : BilinAxis();
-    const BilinAxis by = guided ? buildBilinAxis(ay.lpos, oY.h) : BilinAxis();
+    const BilinAxis &bx = ax.lumaBilin;
+    const BilinAxis &by = ay.lumaBilin;
     // Mutual-structure gate map lives at CHROMA res: sample at (scx, scy).
     const bool useMs = guided && d.ms > 0.0 && gm.ms.w > 0;
-    const BilinAxis mbx = useMs ? buildBilinAxis(ax.pos, gm.ms.w) : BilinAxis();
-    const BilinAxis mby = useMs ? buildBilinAxis(ay.pos, gm.ms.h) : BilinAxis();
+    const BilinAxis mbxFallback = useMs && gm.ms.w != U.w
+        ? buildBilinAxis(ax.pos, gm.ms.w) : BilinAxis();
+    const BilinAxis mbyFallback = useMs && gm.ms.h != U.h
+        ? buildBilinAxis(ay.pos, gm.ms.h) : BilinAxis();
+    const BilinAxis &mbx = gm.ms.w == U.w ? ax.chromaBilin : mbxFallback;
+    const BilinAxis &mby = gm.ms.h == U.h ? ay.chromaBilin : mbyFallback;
     const float msStrength = float(d.ms);
     // probe distance: one chroma tap spacing, in source luma px
     const float spOut = float(std::max(job.rw, job.rh));
@@ -38,102 +52,192 @@ void reconstructChroma(const ChromaJob &job) {
     const bool radial = d.radial;
     const int lutN = radial ? int(d.lut.size()) : 0;
     const float *lut = radial ? d.lut.data() : nullptr;
+    const auto radialOwner = radial
+        ? cachedRadialWeights(&d, ax, ay, U.w, U.h)
+        : std::shared_ptr<const RadialWeightTable>{};
     // per-axis downscale AA factors for radial base weights (chroma units)
     const float invWxC = float(std::min(1.0, double(outU.w) / U.w));
     const float invWyC = float(std::min(1.0, double(outU.h) / U.h));
     const bool clampHull = d.arMargin >= 0.0;
     const float margin = float(std::max(0.0, d.arMargin));
-    // SIMD path requires the full padded window to be inside the plane
-    [[maybe_unused]] const bool simdOK = U.w >= ax.sup;
+    // SIMD uses masked tails for fixed 2/4/6-tap kernels. The logical tables
+    // remain exact-sized; only valid source lanes are touched.
+    [[maybe_unused]] const bool simdOK = Backend::lanes > 1 &&
+        U.w >= ax.sup;
+
+    std::vector<uint16_t> activeX, activeY;
+    if (job.metrics) {
+        const uint64_t pixels = uint64_t(outU.w) * outU.h;
+        job.metrics->outputPixels += pixels;
+        job.metrics->addWork(job.metricStage, pixels);
+        activeX.assign(outU.w, 0);
+        activeY.assign(outU.h, 0);
+        for (int x = 0; x < outU.w; ++x)
+            for (int i = 0; i < ax.sup; ++i)
+                activeX[x] += ax.am[size_t(x) * ax.sup + i] != 0.0f;
+        for (int y = 0; y < outU.h; ++y)
+            for (int j = 0; j < ay.sup; ++j)
+                activeY[y] += ay.am[size_t(y) * ay.sup + j] != 0.0f;
+    }
+
+    struct GuidePixel {
+        float luma = 0.0f;
+        float nx = 0.0f, ny = 0.0f;
+        float coherence = 0.0f;
+        float minDiffNormal = 0.0f;
+        float ridgeReversal = 0.0f;
+        float phaseGate = 0.0f;
+        float mutualFade = 1.0f;
+        bool hasDirection = false;
+    };
+    std::vector<GuidePixel> guideRow(outU.w);
+    const bool directSparseMask = job.mask &&
+        job.maskW == outU.w && job.maskH == outU.h;
+    std::vector<int> sparseMaskX, sparseMaskY;
+    if (job.mask && !directSparseMask) {
+        sparseMaskX.resize(outU.w);
+        sparseMaskY.resize(outU.h);
+        for (int ox = 0; ox < outU.w; ++ox)
+            sparseMaskX[ox] = std::min(
+                job.maskW - 1, int(int64_t(ox) * job.maskW / outU.w));
+        for (int oy = 0; oy < outU.h; ++oy)
+            sparseMaskY[oy] = std::min(
+                job.maskH - 1, int(int64_t(oy) * job.maskH / outU.h));
+    }
+    auto sparseActive = [&](int ox, int oy) {
+        if (!job.mask)
+            return true;
+        const int mx = directSparseMask ? ox : sparseMaskX[ox];
+        const int my = directSparseMask ? oy : sparseMaskY[oy];
+        return job.mask[size_t(my) * job.maskW + mx] != 0;
+    };
+    struct ActiveSpan { int begin, end; };
+    std::vector<ActiveSpan> activeSpans;
+    std::vector<size_t> rowSpanOffsets;
+    if (job.mask) {
+        ScopedCpuTimer timer(job.metrics, CpuProfileSlot::GuidedActiveRows);
+        rowSpanOffsets.resize(size_t(outU.h) + 1);
+        for (int oy = 0; oy < outU.h; ++oy) {
+            rowSpanOffsets[oy] = activeSpans.size();
+            int ox = 0;
+            while (ox < outU.w) {
+                while (ox < outU.w && !sparseActive(ox, oy))
+                    ++ox;
+                const int begin = ox;
+                while (ox < outU.w && sparseActive(ox, oy))
+                    ++ox;
+                if (begin < ox)
+                    activeSpans.push_back({begin, ox});
+            }
+        }
+        rowSpanOffsets[outU.h] = activeSpans.size();
+    }
+    auto prepareGuideRow = [&](int oy) {
+        if (!guided)
+            return;
+        const int byi = by.i0[oy];
+        const float byf = by.f[oy];
+        auto preparePixel = [&](int ox) {
+            GuidePixel &meta = guideRow[ox];
+            meta = GuidePixel{};
+            const int bxi = bx.i0[ox];
+            const float bxf = bx.f[ox];
+            meta.luma = bilinearFast(oY, bxi, bxf, byi, byf);
+            const float jxx = bilinearFast(gm.jxx, bxi, bxf, byi, byf);
+            const float jxy = bilinearFast(gm.jxy, bxi, bxf, byi, byf);
+            const float jyy = bilinearFast(gm.jyy, bxi, bxf, byi, byf);
+            const float jsum = jxx + jyy;
+            const TensorDirection direction = principalTensorDirection(jxx, jxy, jyy);
+            meta.coherence = direction.coherence;
+            meta.nx = direction.nx;
+            meta.ny = direction.ny;
+            meta.hasDirection = jsum > 1e-6f;
+
+            const float lx = ax.lpos[ox], ly = ay.lpos[oy];
+            if (meta.hasDirection) {
+                const float yA = bilinear(oY, lx - spOut * meta.nx,
+                                          ly - spOut * meta.ny);
+                const float yB = bilinear(oY, lx + spOut * meta.nx,
+                                          ly + spOut * meta.ny);
+                meta.minDiffNormal = std::min(std::fabs(yA - meta.luma),
+                                              std::fabs(yB - meta.luma));
+            }
+            if (d.ridge && meta.hasDirection) {
+                const float dl = 1.5f * spOut;
+                const float ym2 = bilinear(oY, lx - 2 * dl * meta.nx,
+                                            ly - 2 * dl * meta.ny);
+                const float ym1 = bilinear(oY, lx - dl * meta.nx,
+                                            ly - dl * meta.ny);
+                const float yp1 = bilinear(oY, lx + dl * meta.nx,
+                                            ly + dl * meta.ny);
+                const float yp2 = bilinear(oY, lx + 2 * dl * meta.nx,
+                                            ly + 2 * dl * meta.ny);
+                const float difference[4] = {
+                    ym1 - ym2, meta.luma - ym1, yp1 - meta.luma, yp2 - yp1
+                };
+                for (int q = 0; q < 3; ++q) {
+                    const float a = difference[q], b = difference[q + 1];
+                    if (a > 0.0f && b < 0.0f)
+                        meta.ridgeReversal = std::max(
+                            meta.ridgeReversal, std::min(a, -b));
+                    if (a < 0.0f && b > 0.0f)
+                        meta.ridgeReversal = std::max(
+                            meta.ridgeReversal, std::min(-a, b));
+                }
+            }
+            const float fx = ax.pos[ox] - std::floor(ax.pos[ox]);
+            const float fy = ay.pos[oy] - std::floor(ay.pos[oy]);
+            const float phx = std::min(fx, 1.0f - fx);
+            const float phy = std::min(fy, 1.0f - fy);
+            meta.phaseGate = (1.0f - 2.0f * phx) * (1.0f - 2.0f * phy);
+            if (useMs) {
+                const float gate = bilinearFast(gm.ms, mbx.i0[ox], mbx.f[ox],
+                                                 mby.i0[oy], mby.f[oy]);
+                meta.mutualFade = 1.0f - msStrength * (1.0f - gate);
+            }
+        };
+        if (job.mask) {
+            for (size_t span = rowSpanOffsets[oy]; span < rowSpanOffsets[oy + 1]; ++span)
+                for (int ox = activeSpans[span].begin; ox < activeSpans[span].end; ++ox)
+                    preparePixel(ox);
+        } else {
+            for (int ox = 0; ox < outU.w; ++ox)
+                preparePixel(ox);
+        }
+    };
 
     for (int oy = 0; oy < outU.h; ++oy) {
         const int ty0 = ay.start[oy];
         const float *wyp = &ay.w[size_t(oy) * ay.sup];
         const float scy = ay.pos[oy];
+        {
+            ScopedCpuTimer timer(job.metrics, CpuProfileSlot::GuidedMetadata);
+            prepareGuideRow(oy);
+        }
 
         float *dstRowU = outU.row(oy);
         float *dstRowV = outV.row(oy);
 
-        for (int ox = 0; ox < outU.w; ++ox) {
+        ScopedCpuTimer tapTimer(job.metrics, CpuProfileSlot::GuidedTapAccumulation);
+        auto processPixel = [&](int ox) {
             const int tx0 = ax.start[ox];
             const float *wxp = &ax.w[size_t(ox) * ax.sup];
             const float scx = ax.pos[ox];
+            const float *radialBase = radialOwner ? radialOwner->at(ox, oy) : nullptr;
 
-            float L0 = 0.0f, nxv = 0.0f, nyv = 0.0f, minDiffN = 0.0f;
-            float coherence = 0.0f, ssRamp = 0.0f;
-            bool hasDir = false;
-            float ridgeRev = 0.0f; // sign-reversal depth along the gradient
-            // Subpixel phase: distance to nearest source sample, [0, 0.5]
-            float phx = 0.0f, phy = 0.0f;
-            // Sparse early-out: plain kernel is provably sufficient here.
-            // Mask is at source luma res; map output coords back.
-            if (job.mask && !job.mask[size_t(std::min(job.maskH - 1, oy * job.maskH / outU.h)) * job.maskW
-                                      + std::min(job.maskW - 1, ox * job.maskW / outU.w)]) {
-                dstRowU[ox] = job.plainU->row(oy)[ox];
-                dstRowV[ox] = job.plainV->row(oy)[ox];
-                continue;
+            const GuidePixel &meta = guideRow[ox];
+            const float L0 = meta.luma;
+            const float nxv = meta.nx, nyv = meta.ny;
+            const float minDiffN = meta.minDiffNormal;
+            const float coherence = meta.coherence;
+            const bool hasDir = meta.hasDirection;
+            const float ridgeRev = meta.ridgeReversal;
+            float ssRamp = 0.0f;
+            if (job.metrics) {
+                const uint64_t taps = uint64_t(activeX[ox]) * activeY[oy];
+                job.metrics->tapsVisited += taps;
+                job.metrics->taps[static_cast<size_t>(job.metricStage)] += taps;
             }
-            if (guided) {
-                // Guide values at the reconstruction center, from the source
-                // luma at the exact (fractional) mapped position — never from
-                // chroma-res averages, which blend across the very edges we
-                // are trying to snap to.
-                const int bxi = bx.i0[ox], byi = by.i0[oy];
-                const float bxf = bx.f[ox], byf = by.f[oy];
-                L0 = bilinearFast(oY, bxi, bxf, byi, byf);
-                const float jxx = bilinearFast(gm.jxx, bxi, bxf, byi, byf);
-                const float jxy = bilinearFast(gm.jxy, bxi, bxf, byi, byf);
-                const float jyy = bilinearFast(gm.jyy, bxi, bxf, byi, byf);
-                const float jdiff = jxx - jyy, jsum = jxx + jyy;
-                // coherence in [0,1]: 1 = clean single orientation
-                coherence = std::sqrt(jdiff * jdiff + 4.0f * jxy * jxy) / (jsum + 1e-12f);
-                // dominant eigenvector = edge normal (sign-free: all uses are
-                // quadratic or symmetric probes)
-                const float theta = 0.5f * std::atan2(2.0f * jxy, jdiff);
-                nxv = std::cos(theta);
-                nyv = std::sin(theta);
-                hasDir = jsum > 1e-6f;
-
-                // Step/ramp discriminator: min |diff| to the two luma
-                // samples one chroma spacing away along the gradient normal.
-                // On a step (any orientation) one of them is same-side (~0);
-                // on a ramp both equal the per-tap slope.
-                if (hasDir) {
-                    const float lcx1 = ax.lpos[ox], lcy1 = ay.lpos[oy];
-                    const float yA = bilinear(oY, lcx1 - spOut * nxv, lcy1 - spOut * nyv);
-                    const float yB = bilinear(oY, lcx1 + spOut * nxv, lcy1 + spOut * nyv);
-                    minDiffN = std::min(std::fabs(yA - L0), std::fabs(yB - L0));
-                }
-
-                // Ridge detection: probe the luma profile along the gradient
-                // normal at -2d,-d,0,+d,+2d. A step or ramp is monotonic; a
-                // thin line (line art) produces a sign reversal. Guidance is
-                // faded out on thin lines: there the true chroma is a soft
-                // blend, and "luma has an edge" does not imply "chroma has
-                // an edge".
-                if (d.ridge && hasDir) {
-                    const float dl = 1.5f * spOut; // span +/-3 chroma-tap spacings
-                    const float lcx2 = ax.lpos[ox], lcy2 = ay.lpos[oy];
-                    const float ym2 = bilinear(oY, lcx2 - 2 * dl * nxv, lcy2 - 2 * dl * nyv);
-                    const float ym1 = bilinear(oY, lcx2 - dl * nxv, lcy2 - dl * nyv);
-                    const float yp1 = bilinear(oY, lcx2 + dl * nxv, lcy2 + dl * nyv);
-                    const float yp2 = bilinear(oY, lcx2 + 2 * dl * nxv, lcy2 + 2 * dl * nyv);
-                    const float dd[4] = { ym1 - ym2, L0 - ym1, yp1 - L0, yp2 - yp1 };
-                    float rev = 0.0f;
-                    for (int q = 0; q < 3; ++q) {
-                        const float a = dd[q], b = dd[q + 1];
-                        if (a > 0.0f && b < 0.0f) rev = std::max(rev, std::min(a, -b));
-                        if (a < 0.0f && b > 0.0f) rev = std::max(rev, std::min(-a, b));
-                    }
-                    ridgeRev = rev;
-                }
-
-                const float fx = scx - std::floor(scx);
-                const float fy = scy - std::floor(scy);
-                phx = std::min(fx, 1.0f - fx);
-                phy = std::min(fy, 1.0f - fy);
-            }
-
             // Pass 1 (guided only): window luma range -> adaptive sigma;
             // chroma hull of both planes for anti-ringing.
             float maxAbsDL = 0.0f;
@@ -144,7 +248,7 @@ void reconstructChroma(const ChromaJob &job) {
                 const float *amCol = &ax.am[size_t(ox) * ax.sup];
                 for (int j = 0; j < ay.sup; ++j) {
                     if (amRow[j] == 0.0f)
-                        continue; // SIMD-padding row: never part of the logical window
+                        continue; // outside the logical kernel window
                     const int ty = std::clamp(ty0 + j, 0, U.h - 1);
                     const float *lcRow = guided ? gm.lc.row(ty) : nullptr;
                     const float *uRow = U.row(ty);
@@ -160,17 +264,19 @@ void reconstructChroma(const ChromaJob &job) {
                         const __m256 vInf = _mm256_set1_ps(1e30f);
                         const __m256 vNInf = _mm256_set1_ps(-1e30f);
                         const __m256 vZero = _mm256_setzero_ps();
-                        for (; i + 8 <= ax.sup; i += 8) {
+                        for (; i < ax.sup; i += 8) {
+                            const __m256i laneMask = activeLaneMask(std::min(8, ax.sup - i));
                             const int tx = tx0 + i;
-                            const __m256 vM = _mm256_loadu_ps(amCol + i);
+                            const __m256 vM = _mm256_maskload_ps(amCol + i, laneMask);
                             const __m256 vActive = _mm256_cmp_ps(vM, vZero, _CMP_GT_OQ);
                             if (guided) {
-                                const __m256 dL = _mm256_sub_ps(_mm256_loadu_ps(lcRow + tx), vL0);
+                                const __m256 dL = _mm256_sub_ps(
+                                    _mm256_maskload_ps(lcRow + tx, laneMask), vL0);
                                 vMaxD = _mm256_max_ps(vMaxD,
                                     _mm256_and_ps(_mm256_mul_ps(dL, vM), vAbs));
                             }
-                            const __m256 vU = _mm256_loadu_ps(uRow + tx);
-                            const __m256 vV = _mm256_loadu_ps(vRow + tx);
+                            const __m256 vU = _mm256_maskload_ps(uRow + tx, laneMask);
+                            const __m256 vV = _mm256_maskload_ps(vRow + tx, laneMask);
                             vMinU = _mm256_min_ps(vMinU, _mm256_blendv_ps(vInf, vU, vActive));
                             vMaxU = _mm256_max_ps(vMaxU, _mm256_blendv_ps(vNInf, vU, vActive));
                             vMinV = _mm256_min_ps(vMinV, _mm256_blendv_ps(vInf, vV, vActive));
@@ -247,12 +353,7 @@ void reconstructChroma(const ChromaJob &job) {
             // the plain kernel's (truthful) softness is kept. This is what
             // fixes the hardL_softC residual: a soft chroma blend under a
             // hard luma edge fails the profile-correlation test.
-            float msFade = 1.0f;
-            if (useMs) {
-                const float g = bilinearFast(gm.ms, mbx.i0[ox], mbx.f[ox],
-                                             mby.i0[oy], mby.f[oy]);
-                msFade = 1.0f - msStrength * (1.0f - g);
-            }
+            const float msFade = meta.mutualFade;
             // strength scales the sim discrimination itself: lambda -> 0
             // must degrade continuously to the plain kernel
             const float guideFade = ridgeFade * cedgeFade * msFade * strength;
@@ -269,7 +370,7 @@ void reconstructChroma(const ChromaJob &job) {
                 const int ncy = std::clamp(int(std::lround(scy)), 0, gm.lc.h - 1);
                 const float dL0 = gm.lc.at(ncx, ncy) - L0;
                 const float sim0 = 1.0f / (1.0f + dL0 * dL0 * invSigma2);
-                const float pg = (1.0f - 2.0f * phx) * (1.0f - 2.0f * phy);
+                const float pg = meta.phaseGate;
                 rescue = float(d.rescue) * guideFade * pg * pg * (1.0f - sim0);
                 // Per-kernel-family rescue gating: the "phase 0 = delta"
                 // assumption only holds for separable kernels. jinc(1)=0.18,
@@ -301,8 +402,10 @@ void reconstructChroma(const ChromaJob &job) {
                             for (int i = 0; i < ax.sup; ++i) {
                                 if (ax.am[size_t(ox) * ax.sup + i] == 0.0f) continue;
                                 const float dxc = (tx0 + i - scx) * invWxC;
-                                const float w = lutLookup(lut, lutN,
-                                    std::sqrt(dxc * dxc + dyc * dyc) * d.lutScale);
+                                const float w = radialBase
+                                    ? radialBase[size_t(j) * ax.sup + i]
+                                    : lutLookup(lut, lutN,
+                                        std::sqrt(dxc * dxc + dyc * dyc) * d.lutScale);
                                 mx = std::max(mx, std::fabs(w));
                                 ss += w * w;
                             }
@@ -352,13 +455,17 @@ void reconstructChroma(const ChromaJob &job) {
                     const __m256 vWy = _mm256_set1_ps(wy);
                     const __m256 vDy = _mm256_set1_ps(dy);
 
-                    for (int i = 0; i + 8 <= ax.sup; i += 8) {
+                    for (int i = 0; i < ax.sup; i += 8) {
+                        const __m256i laneMask = activeLaneMask(std::min(8, ax.sup - i));
                         const int tx = tx0 + i; // guaranteed in-range by start clamping
-                        const __m256 vAm = _mm256_loadu_ps(amCol2 + i);
-                        const __m256 vU = _mm256_loadu_ps(uRow + tx);
-                        const __m256 vV = _mm256_loadu_ps(vRow + tx);
+                        const __m256 vAm = _mm256_maskload_ps(amCol2 + i, laneMask);
+                        const __m256 vU = _mm256_maskload_ps(uRow + tx, laneMask);
+                        const __m256 vV = _mm256_maskload_ps(vRow + tx, laneMask);
                         __m256 vWx;
-                        if (radial) {
+                        if (radialBase) {
+                            vWx = _mm256_maskload_ps(
+                                radialBase + size_t(j) * ax.sup + i, laneMask);
+                        } else if (radial) {
                             // 2D radial base weight from the jinc LUT
                             const __m256 vDxc = _mm256_mul_ps(
                                 _mm256_add_ps(vDxBase, _mm256_set1_ps(float(i) * float(job.rw))),
@@ -368,12 +475,13 @@ void reconstructChroma(const ChromaJob &job) {
                             vWx = lutLookup8(lut, lutN,
                                 _mm256_mul_ps(_mm256_sqrt_ps(r2), _mm256_set1_ps(d.lutScale)));
                         } else {
-                            vWx = _mm256_mul_ps(_mm256_loadu_ps(wxp + i), vWy);
+                            vWx = _mm256_mul_ps(
+                                _mm256_maskload_ps(wxp + i, laneMask), vWy);
                         }
 
                         __m256 wG;
                         if (guided) {
-                            const __m256 vLc = _mm256_loadu_ps(lcRow + tx);
+                            const __m256 vLc = _mm256_maskload_ps(lcRow + tx, laneMask);
                             const __m256 vDx = _mm256_add_ps(vDxBase,
                                 _mm256_set1_ps(float(i) * float(job.rw)));
                             // sim = 1 / (1 + dL^2 * invSigma2)
@@ -397,7 +505,7 @@ void reconstructChroma(const ChromaJob &job) {
                             wG = vWx;
                         }
 
-                        wG = _mm256_mul_ps(wG, vAm); // mask SIMD-padding taps
+                        wG = _mm256_mul_ps(wG, vAm); // mask inactive/tail lanes
                         vAccU = _mm256_fmadd_ps(wG, vU, vAccU);
                         vAccV = _mm256_fmadd_ps(wG, vV, vAccV);
                         vSum = _mm256_add_ps(vSum, wG);
@@ -429,7 +537,9 @@ void reconstructChroma(const ChromaJob &job) {
                             continue;
                         const int tx = std::clamp(tx0 + i, 0, U.w - 1);
                         float wx;
-                        if (radial) {
+                        if (radialBase) {
+                            wx = radialBase[size_t(j) * ax.sup + i];
+                        } else if (radial) {
                             const float dxc = (tx0 + i - scx) * invWxC; // chroma units, AA-scaled
                             const float dyc = (ty0 + j - scy) * invWyC;
                             wx = lutLookup(lut, lutN, std::sqrt(dxc * dxc + dyc * dyc) * d.lutScale);
@@ -591,44 +701,654 @@ void reconstructChroma(const ChromaJob &job) {
                 valueV = std::clamp(valueV, double(hullMinV - margin), double(hullMaxV + margin));
             }
 
-            dstRowU[ox] = static_cast<float>(valueU);
-            dstRowV[ox] = static_cast<float>(valueV);
-
-            if (job.selW2) {
+            if (job.selectorMaps) {
                 // selector weights: hard-edge-ness times axis/diagonal split.
                 // diag = 2|nx*ny|: 0 on axis-aligned edges, 1 at 45 degrees
                 const float diag = hasDir ? std::min(1.0f, 2.0f * std::fabs(nxv * nyv)) : 0.0f;
                 const float hedgy = (1.0f - ssRamp) * guideFade;
-                job.selW2->at(ox, oy) = hedgy * (1.0f - diag);
-                job.selW3->at(ox, oy) = hedgy * diag;
+                const float w2 = hedgy * (1.0f - diag) * job.selectorStrength;
+                const float w3 = hedgy * diag * job.selectorStrength;
+                if (w2 >= 1e-4f || w3 >= 1e-4f) {
+                    const LGFMaps &lgf = *job.selectorMaps;
+                    const int cx = ax.chromaBilin.i0[ox];
+                    const float cxf = ax.chromaBilin.f[ox];
+                    const int cy = ay.chromaBilin.i0[oy];
+                    const float cyf = ay.chromaBilin.f[oy];
+                    const float baseU = dstRowU[ox], baseV = dstRowV[ox];
+                    const float au = bilinearFast(lgf.aU, cx, cxf, cy, cyf);
+                    const float bu = bilinearFast(lgf.bU, cx, cxf, cy, cyf);
+                    const float av = bilinearFast(lgf.aV, cx, cxf, cy, cyf);
+                    const float bv = bilinearFast(lgf.bV, cx, cxf, cy, cyf);
+                    const float cu = bilinearFast(lgf.confU, cx, cxf, cy, cyf);
+                    const float cv = bilinearFast(lgf.confV, cx, cxf, cy, cyf);
+                    valueU = baseU + w2 * (float(valueU) - baseU)
+                                   + w3 * cu * (au * L0 + bu - baseU);
+                    valueV = baseV + w2 * (float(valueV) - baseV)
+                                   + w3 * cv * (av * L0 + bv - baseV);
+                } else {
+                    valueU = dstRowU[ox];
+                    valueV = dstRowV[ox];
+                }
             }
+            dstRowU[ox] = static_cast<float>(valueU);
+            dstRowV[ox] = static_cast<float>(valueV);
+        };
+        if (job.mask) {
+            for (size_t span = rowSpanOffsets[oy]; span < rowSpanOffsets[oy + 1]; ++span)
+                for (int ox = activeSpans[span].begin; ox < activeSpans[span].end; ++ox)
+                    processPixel(ox);
+        } else {
+            for (int ox = 0; ox < outU.w; ++ox)
+                processPixel(ox);
         }
     }
 }
 
+void reconstructChroma(const ChromaJob &job) {
+    reconstructChromaImpl<NativeBackend>(job);
+}
 
-// Plain (unguided) chroma reconstruction. Deliberately NOT a separate fast
-// path: it runs the SAME reconstructChroma machinery with strength=0, so
-// that (a) strength=0 is bit-continuous with strength->0+ (a separate
-// resampleH/V path used different boundary semantics: renormalized truncated
-// kernels vs clamped taps, giving 0.05 jumps at borders between strength 0
-// and 1e-6), and (b) the jinc plain path honors vertical siting instead of
-// the historically hardcoded shiftY=0. Base for algo 4/6, the sparse fill,
-// and the strength=0 A/B reference.
+
+namespace {
+
+template <class Backend, bool Dual>
+void plainChromaImpl(const LGCRData &d, const Plane &U, const Plane &V,
+                     Plane &outU, Plane &outV, const ChromaAxis &ax,
+                     const ChromaAxis &ay, const RadialWeightTable *radialTable,
+                     PipelineMetrics *metrics) {
+    const bool radial = d.radial;
+    const int lutN = radial ? static_cast<int>(d.lut.size()) : 0;
+    const float *lut = radial ? d.lut.data() : nullptr;
+    const float invWxC = float(std::min(1.0, double(outU.w) / U.w));
+    const float invWyC = float(std::min(1.0, double(outU.h) / U.h));
+    const bool clampHull = d.arMargin >= 0.0;
+    const float margin = float(std::max(0.0, d.arMargin));
+    const bool vectorWindow = Backend::lanes > 1 && ax.sup >= 6 && U.w >= ax.sup;
+
+    std::vector<uint16_t> activeX, activeY;
+    if (metrics) {
+        const uint64_t pixels = uint64_t(outU.w) * outU.h;
+        metrics->outputPixels += pixels;
+        metrics->addWork(Stage::BuildBaseChroma, pixels);
+        activeX.assign(outU.w, 0);
+        activeY.assign(outU.h, 0);
+        for (int x = 0; x < outU.w; ++x)
+            for (int i = 0; i < ax.sup; ++i)
+                activeX[x] += ax.am[size_t(x) * ax.sup + i] != 0.0f;
+        for (int y = 0; y < outU.h; ++y)
+            for (int j = 0; j < ay.sup; ++j)
+                activeY[y] += ay.am[size_t(y) * ay.sup + j] != 0.0f;
+    }
+
+    for (int oy = 0; oy < outU.h; ++oy) {
+        const int ty0 = ay.start[oy];
+        const float *wyp = &ay.w[size_t(oy) * ay.sup];
+        const float *amRow = &ay.am[size_t(oy) * ay.sup];
+        const float scy = ay.pos[oy];
+        float *dstU = outU.row(oy);
+        float *dstV = Dual ? outV.row(oy) : nullptr;
+
+        for (int ox = 0; ox < outU.w; ++ox) {
+            const int tx0 = ax.start[ox];
+            const float *wxp = &ax.w[size_t(ox) * ax.sup];
+            const float *amCol = &ax.am[size_t(ox) * ax.sup];
+            const float scx = ax.pos[ox];
+            const float *cachedWeights = radialTable ? radialTable->at(ox, oy) : nullptr;
+            [[maybe_unused]] const bool cachedNormalization = cachedWeights &&
+                !radialTable->weightSum.empty();
+            if (metrics) {
+                const uint64_t taps = uint64_t(activeX[ox]) * activeY[oy];
+                metrics->tapsVisited += taps;
+                metrics->taps[static_cast<size_t>(Stage::BuildBaseChroma)] += taps;
+            }
+
+            double accU = 0.0, accV = 0.0, wsum = 0.0, sumAbsW = 0.0;
+            float hullMinU = 1e30f, hullMaxU = -1e30f;
+            float hullMinV = 1e30f, hullMaxV = -1e30f;
+
+#ifdef __AVX2__
+            if constexpr (Backend::lanes == 8) {
+                if (vectorWindow) {
+                    typename Backend::Vec vAccU = Backend::zero();
+                    typename Backend::Vec vAccV = Backend::zero();
+                    typename Backend::Vec vSum = Backend::zero();
+                    typename Backend::Vec vSumAbs = Backend::zero();
+                    typename Backend::Vec vMinU = Backend::set1(1e30f);
+                    typename Backend::Vec vMaxU = Backend::set1(-1e30f);
+                    typename Backend::Vec vMinV = Backend::set1(1e30f);
+                    typename Backend::Vec vMaxV = Backend::set1(-1e30f);
+                    const auto zero = Backend::zero();
+                    for (int j = 0; j < ay.sup; ++j) {
+                        if (amRow[j] == 0.0f)
+                            continue;
+                        const int ty = std::clamp(ty0 + j, 0, U.h - 1);
+                        const float *uRow = U.row(ty);
+                        const float *vRow = Dual ? V.row(ty) : nullptr;
+                        for (int i = 0; i < ax.sup; i += Backend::lanes) {
+                            const __m256i laneMask = activeLaneMask(
+                                std::min(Backend::lanes, ax.sup - i));
+                            const auto activity = _mm256_maskload_ps(amCol + i, laneMask);
+                            const auto active = Backend::greater(activity, zero);
+                            const auto vu = _mm256_maskload_ps(uRow + tx0 + i, laneMask);
+                            typename Backend::Vec weight;
+                            if (cachedWeights) {
+                                weight = _mm256_maskload_ps(
+                                    cachedWeights + size_t(j) * ax.sup + i, laneMask);
+                            } else if (radial) {
+                                const __m256 indices = _mm256_setr_ps(
+                                    float(i), float(i + 1), float(i + 2), float(i + 3),
+                                    float(i + 4), float(i + 5), float(i + 6), float(i + 7));
+                                const __m256 dx = _mm256_mul_ps(
+                                    _mm256_sub_ps(_mm256_add_ps(_mm256_set1_ps(float(tx0)), indices),
+                                                  _mm256_set1_ps(scx)),
+                                    _mm256_set1_ps(invWxC));
+                                const float dy = (ty0 + j - scy) * invWyC;
+                                const __m256 r2 = _mm256_fmadd_ps(
+                                    dx, dx, _mm256_set1_ps(dy * dy));
+                                weight = lutLookup8(lut, lutN,
+                                    _mm256_mul_ps(_mm256_sqrt_ps(r2),
+                                                  _mm256_set1_ps(d.lutScale)));
+                            } else {
+                                weight = Backend::mul(_mm256_maskload_ps(wxp + i, laneMask),
+                                                      Backend::set1(wyp[j]));
+                            }
+                            if (!cachedWeights)
+                                weight = Backend::mul(weight, activity);
+                            vAccU = Backend::fmadd(weight, vu, vAccU);
+                            if constexpr (Dual) {
+                                const auto vv = _mm256_maskload_ps(vRow + tx0 + i, laneMask);
+                                vAccV = Backend::fmadd(weight, vv, vAccV);
+                                vMinV = Backend::min(vMinV,
+                                    Backend::select(active, vv, Backend::set1(1e30f)));
+                                vMaxV = Backend::max(vMaxV,
+                                    Backend::select(active, vv, Backend::set1(-1e30f)));
+                            }
+                            if (!cachedNormalization) {
+                                vSum = Backend::add(vSum, weight);
+                                vSumAbs = Backend::add(vSumAbs, Backend::abs(weight));
+                            }
+                            vMinU = Backend::min(vMinU,
+                                Backend::select(active, vu, Backend::set1(1e30f)));
+                            vMaxU = Backend::max(vMaxU,
+                                Backend::select(active, vu, Backend::set1(-1e30f)));
+                        }
+                    }
+                    accU = Backend::horizontalSum(vAccU);
+                    if constexpr (Dual)
+                        accV = Backend::horizontalSum(vAccV);
+                    if (cachedNormalization) {
+                        const size_t phase = radialTable->phaseAt(ox, oy);
+                        wsum = radialTable->weightSum[phase];
+                        sumAbsW = radialTable->absoluteWeightSum[phase];
+                    } else {
+                        wsum = Backend::horizontalSum(vSum);
+                        sumAbsW = Backend::horizontalSum(vSumAbs);
+                    }
+                    hullMinU = Backend::horizontalMin(vMinU);
+                    hullMaxU = Backend::horizontalMax(vMaxU);
+                    if constexpr (Dual) {
+                        hullMinV = Backend::horizontalMin(vMinV);
+                        hullMaxV = Backend::horizontalMax(vMaxV);
+                    }
+                }
+            }
+#endif
+            if (!vectorWindow) {
+                for (int j = 0; j < ay.sup; ++j) {
+                    if (amRow[j] == 0.0f)
+                        continue;
+                    const int ty = std::clamp(ty0 + j, 0, U.h - 1);
+                    const float *uRow = U.row(ty);
+                    const float *vRow = Dual ? V.row(ty) : nullptr;
+                    for (int i = 0; i < ax.sup; ++i) {
+                        if (amCol[i] == 0.0f)
+                            continue;
+                        const int tx = std::clamp(tx0 + i, 0, U.w - 1);
+                        float weight;
+                        if (cachedWeights) {
+                            weight = cachedWeights[size_t(j) * ax.sup + i];
+                        } else if (radial) {
+                            const float dx = (tx0 + i - scx) * invWxC;
+                            const float dy = (ty0 + j - scy) * invWyC;
+                            weight = lutLookup(lut, lutN,
+                                std::sqrt(dx * dx + dy * dy) * d.lutScale);
+                        } else {
+                            weight = wxp[i] * wyp[j];
+                        }
+                        const float u = uRow[tx];
+                        accU += double(weight) * u;
+                        wsum += weight;
+                        sumAbsW += std::fabs(weight);
+                        hullMinU = std::min(hullMinU, u); hullMaxU = std::max(hullMaxU, u);
+                        if constexpr (Dual) {
+                            const float v = vRow[tx];
+                            accV += double(weight) * v;
+                            hullMinV = std::min(hullMinV, v);
+                            hullMaxV = std::max(hullMaxV, v);
+                        }
+                    }
+                }
+            }
+
+            double valueU, valueV = 0.0;
+            if (wsum > 1e-6 && wsum >= 0.05 * sumAbsW) {
+                valueU = accU / wsum;
+                if constexpr (Dual)
+                    valueV = accV / wsum;
+            } else {
+                valueU = bilinear(U, scx, scy);
+                if constexpr (Dual)
+                    valueV = bilinear(V, scx, scy);
+            }
+            if (clampHull) {
+                valueU = std::clamp(valueU, double(hullMinU - margin),
+                                    double(hullMaxU + margin));
+                if constexpr (Dual)
+                    valueV = std::clamp(valueV, double(hullMinV - margin),
+                                        double(hullMaxV + margin));
+            }
+            dstU[ox] = static_cast<float>(valueU);
+            if constexpr (Dual)
+                dstV[ox] = static_cast<float>(valueV);
+        }
+    }
+}
+
+template <class Backend, bool Dual>
+void plainChromaBilinear(const Plane &U, const Plane &V,
+                         Plane &outU, Plane &outV, const ChromaAxis &ax,
+                         const ChromaAxis &ay, PipelineMetrics *metrics) {
+    const BilinAxis &bx = ax.chromaBilin;
+    const BilinAxis &by = ay.chromaBilin;
+    for (int oy = 0; oy < outU.h; ++oy) {
+        const int y0 = by.i0[oy];
+        const float fy = by.f[oy];
+        float *du = outU.row(oy);
+        float *dv = Dual ? outV.row(oy) : nullptr;
+        int ox = 0;
+#ifdef __AVX2__
+        if constexpr (Backend::lanes == 8) {
+            if (U.w >= 2) {
+                const int y1 = U.h == 1 ? y0 : y0 + 1;
+                const float *u0 = U.row(y0), *u1 = U.row(y1);
+                const float *v0 = Dual ? V.row(y0) : nullptr;
+                const float *v1 = Dual ? V.row(y1) : nullptr;
+                const __m256 vfy = _mm256_set1_ps(fy);
+                const __m256i one = _mm256_set1_epi32(1);
+                if (bx.phase2x.enabled) {
+                    for (; ox < bx.phase2x.simdBegin; ++ox) {
+                        du[ox] = bilinearFast(U, bx.i0[ox], bx.f[ox], y0, fy);
+                        if constexpr (Dual)
+                            dv[ox] = bilinearFast(V, bx.i0[ox], bx.f[ox], y0, fy);
+                    }
+                    for (; ox < bx.phase2x.simdEnd; ox += 8) {
+                        const int base = bx.i0[ox];
+                        const __m256i indices = _mm256_sub_epi32(
+                            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(
+                                bx.i0.data() + ox)), _mm256_set1_epi32(base));
+                        const __m256 ixFrac = _mm256_loadu_ps(bx.f.data() + ox);
+                        const __m256 u0Samples = _mm256_loadu_ps(u0 + base);
+                        const __m256 u1Samples = _mm256_loadu_ps(u1 + base);
+                        const __m256 ua = _mm256_permutevar8x32_ps(u0Samples, indices);
+                        const __m256 ub = _mm256_permutevar8x32_ps(
+                            u0Samples, _mm256_add_epi32(indices, one));
+                        const __m256 uc = _mm256_permutevar8x32_ps(u1Samples, indices);
+                        const __m256 ud = _mm256_permutevar8x32_ps(
+                            u1Samples, _mm256_add_epi32(indices, one));
+                        const __m256 ut = _mm256_fmadd_ps(ixFrac, _mm256_sub_ps(ub, ua), ua);
+                        const __m256 ubase = _mm256_fmadd_ps(ixFrac, _mm256_sub_ps(ud, uc), uc);
+                        _mm256_storeu_ps(du + ox,
+                            _mm256_fmadd_ps(vfy, _mm256_sub_ps(ubase, ut), ut));
+                        if constexpr (Dual) {
+                            const __m256 v0Samples = _mm256_loadu_ps(v0 + base);
+                            const __m256 v1Samples = _mm256_loadu_ps(v1 + base);
+                            const __m256 va = _mm256_permutevar8x32_ps(v0Samples, indices);
+                            const __m256 vb = _mm256_permutevar8x32_ps(
+                                v0Samples, _mm256_add_epi32(indices, one));
+                            const __m256 vc = _mm256_permutevar8x32_ps(v1Samples, indices);
+                            const __m256 vd = _mm256_permutevar8x32_ps(
+                                v1Samples, _mm256_add_epi32(indices, one));
+                            const __m256 vt = _mm256_fmadd_ps(ixFrac, _mm256_sub_ps(vb, va), va);
+                            const __m256 vbase = _mm256_fmadd_ps(ixFrac, _mm256_sub_ps(vd, vc), vc);
+                            _mm256_storeu_ps(dv + ox,
+                                _mm256_fmadd_ps(vfy, _mm256_sub_ps(vbase, vt), vt));
+                        }
+                    }
+                } else for (; ox + 8 <= outU.w; ox += 8) {
+                    const __m256i ix = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i *>(bx.i0.data() + ox));
+                    const __m256 ixFrac = _mm256_loadu_ps(bx.f.data() + ox);
+                    const __m256 ua = _mm256_i32gather_ps(u0, ix, 4);
+                    const __m256 ub = _mm256_i32gather_ps(u0, _mm256_add_epi32(ix, one), 4);
+                    const __m256 uc = _mm256_i32gather_ps(u1, ix, 4);
+                    const __m256 ud = _mm256_i32gather_ps(u1, _mm256_add_epi32(ix, one), 4);
+                    const __m256 ut = _mm256_fmadd_ps(ixFrac, _mm256_sub_ps(ub, ua), ua);
+                    const __m256 ubase = _mm256_fmadd_ps(ixFrac, _mm256_sub_ps(ud, uc), uc);
+                    _mm256_storeu_ps(du + ox,
+                        _mm256_fmadd_ps(vfy, _mm256_sub_ps(ubase, ut), ut));
+                    if constexpr (Dual) {
+                        const __m256 va = _mm256_i32gather_ps(v0, ix, 4);
+                        const __m256 vb = _mm256_i32gather_ps(v0, _mm256_add_epi32(ix, one), 4);
+                        const __m256 vc = _mm256_i32gather_ps(v1, ix, 4);
+                        const __m256 vd = _mm256_i32gather_ps(v1, _mm256_add_epi32(ix, one), 4);
+                        const __m256 vt = _mm256_fmadd_ps(ixFrac, _mm256_sub_ps(vb, va), va);
+                        const __m256 vbase = _mm256_fmadd_ps(ixFrac, _mm256_sub_ps(vd, vc), vc);
+                        _mm256_storeu_ps(dv + ox,
+                            _mm256_fmadd_ps(vfy, _mm256_sub_ps(vbase, vt), vt));
+                    }
+                }
+            }
+        }
+#endif
+        for (; ox < outU.w; ++ox) {
+            du[ox] = bilinearFast(U, bx.i0[ox], bx.f[ox], y0, fy);
+            if constexpr (Dual)
+                dv[ox] = bilinearFast(V, bx.i0[ox], bx.f[ox], y0, fy);
+        }
+    }
+
+    if (metrics) {
+        uint64_t activeX = 0, activeY = 0;
+        for (uint16_t count : ax.activeTaps)
+            activeX += count;
+        for (uint16_t count : ay.activeTaps)
+            activeY += count;
+        const uint64_t pixels = uint64_t(outU.w) * outU.h;
+        const uint64_t taps = activeX * activeY;
+        metrics->outputPixels += pixels;
+        metrics->tapsVisited += taps;
+        metrics->addWork(Stage::BuildBaseChroma, pixels, taps);
+    }
+}
+
+template <class Backend, bool Dual>
+void plainChromaSeparable(const LGCRData &d, const Plane &U, const Plane &V,
+                          Plane &outU, Plane &outV, const ChromaAxis &ax,
+                          const ChromaAxis &ay, PipelineMetrics *metrics) {
+    const int horizontalRows = std::min(U.h, std::max(1, ay.sup));
+    Plane horizontalU(outU.w, horizontalRows), horizontalV;
+    Plane horizontalMinU(outU.w, horizontalRows), horizontalMaxU(outU.w, horizontalRows);
+    Plane horizontalMinV, horizontalMaxV;
+    if constexpr (Dual) {
+        horizontalV = Plane(outU.w, horizontalRows);
+        horizontalMinV = Plane(outU.w, horizontalRows);
+        horizontalMaxV = Plane(outU.w, horizontalRows);
+    }
+    std::vector<int> cachedSourceRows(horizontalRows, -1);
+    uint64_t horizontalRowsComputed = 0;
+    const std::vector<float> &sumX = ax.weightSum;
+    const std::vector<float> &sumAbsX = ax.absoluteWeightSum;
+    const std::vector<float> &sumY = ay.weightSum;
+    const std::vector<float> &sumAbsY = ay.absoluteWeightSum;
+
+    auto computeHorizontalRow = [&](int sourceY) {
+        const int slot = sourceY % horizontalRows;
+        const float *sourceU = U.row(sourceY);
+        const float *sourceV = Dual ? V.row(sourceY) : nullptr;
+        int ox = 0;
+#ifdef __AVX2__
+        if constexpr (Backend::lanes == 8) {
+            const __m256 zero = _mm256_setzero_ps();
+            const __m256 positiveInfinity = _mm256_set1_ps(1e30f);
+            const __m256 negativeInfinity = _mm256_set1_ps(-1e30f);
+            const __m256i zeroIndex = _mm256_setzero_si256();
+            const __m256i lastIndex = _mm256_set1_epi32(U.w - 1);
+            for (; ox + 8 <= outU.w; ox += 8) {
+                const __m256i starts = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i *>(ax.start.data() + ox));
+                __m256 valueU = zero, valueV = zero;
+                __m256 minimumU = positiveInfinity, maximumU = negativeInfinity;
+                __m256 minimumV = positiveInfinity, maximumV = negativeInfinity;
+                for (int tap = 0; tap < ax.sup; ++tap) {
+                    __m256i indices = _mm256_add_epi32(
+                        starts, _mm256_set1_epi32(tap));
+                    indices = _mm256_max_epi32(zeroIndex,
+                        _mm256_min_epi32(lastIndex, indices));
+                    const __m256 active = _mm256_loadu_ps(
+                        ax.tapActivity.data() + size_t(tap) * ax.n + ox);
+                    const __m256 activeMask = _mm256_cmp_ps(
+                        active, zero, _CMP_GT_OQ);
+                    const __m256 weights = _mm256_loadu_ps(
+                        ax.tapWeights.data() + size_t(tap) * ax.n + ox);
+                    const __m256 samplesU = _mm256_i32gather_ps(sourceU, indices, 4);
+                    valueU = _mm256_fmadd_ps(weights, samplesU, valueU);
+                    minimumU = _mm256_min_ps(minimumU,
+                        _mm256_blendv_ps(positiveInfinity, samplesU, activeMask));
+                    maximumU = _mm256_max_ps(maximumU,
+                        _mm256_blendv_ps(negativeInfinity, samplesU, activeMask));
+                    if constexpr (Dual) {
+                        const __m256 samplesV = _mm256_i32gather_ps(sourceV, indices, 4);
+                        valueV = _mm256_fmadd_ps(weights, samplesV, valueV);
+                        minimumV = _mm256_min_ps(minimumV,
+                            _mm256_blendv_ps(positiveInfinity, samplesV, activeMask));
+                        maximumV = _mm256_max_ps(maximumV,
+                            _mm256_blendv_ps(negativeInfinity, samplesV, activeMask));
+                    }
+                }
+                _mm256_storeu_ps(horizontalU.row(slot) + ox, valueU);
+                _mm256_storeu_ps(horizontalMinU.row(slot) + ox, minimumU);
+                _mm256_storeu_ps(horizontalMaxU.row(slot) + ox, maximumU);
+                if constexpr (Dual) {
+                    _mm256_storeu_ps(horizontalV.row(slot) + ox, valueV);
+                    _mm256_storeu_ps(horizontalMinV.row(slot) + ox, minimumV);
+                    _mm256_storeu_ps(horizontalMaxV.row(slot) + ox, maximumV);
+                }
+            }
+        }
+#endif
+        for (; ox < outU.w; ++ox) {
+            const int start = ax.start[ox];
+            const float *weights = &ax.w[size_t(ox) * ax.sup];
+            const float *activity = &ax.am[size_t(ox) * ax.sup];
+            double valueU = 0.0, valueV = 0.0;
+            float minimumU = 1e30f, maximumU = -1e30f;
+            float minimumV = 1e30f, maximumV = -1e30f;
+            for (int i = 0; i < ax.sup; ++i) {
+                if (activity[i] == 0.0f)
+                    continue;
+                const int x = std::clamp(start + i, 0, U.w - 1);
+                const float u = sourceU[x];
+                valueU += double(weights[i]) * u;
+                minimumU = std::min(minimumU, u); maximumU = std::max(maximumU, u);
+                if constexpr (Dual) {
+                    const float v = sourceV[x];
+                    valueV += double(weights[i]) * v;
+                    minimumV = std::min(minimumV, v);
+                    maximumV = std::max(maximumV, v);
+                }
+            }
+            horizontalU.row(slot)[ox] = static_cast<float>(valueU);
+            horizontalMinU.row(slot)[ox] = minimumU;
+            horizontalMaxU.row(slot)[ox] = maximumU;
+            if constexpr (Dual) {
+                horizontalV.row(slot)[ox] = static_cast<float>(valueV);
+                horizontalMinV.row(slot)[ox] = minimumV;
+                horizontalMaxV.row(slot)[ox] = maximumV;
+            }
+        }
+        cachedSourceRows[slot] = sourceY;
+        ++horizontalRowsComputed;
+    };
+
+    const bool clampHull = d.arMargin >= 0.0;
+    const float margin = float(std::max(0.0, d.arMargin));
+    for (int oy = 0; oy < outU.h; ++oy) {
+        const int start = ay.start[oy];
+        const float *weights = &ay.w[size_t(oy) * ay.sup];
+        const float *activity = &ay.am[size_t(oy) * ay.sup];
+        for (int j = 0; j < ay.sup; ++j) {
+            if (activity[j] == 0.0f)
+                continue;
+            const int sourceY = std::clamp(start + j, 0, U.h - 1);
+            const int slot = sourceY % horizontalRows;
+            if (cachedSourceRows[slot] != sourceY)
+                computeHorizontalRow(sourceY);
+        }
+        int ox = 0;
+#ifdef __AVX2__
+        if constexpr (Backend::lanes == 8) {
+            const __m256 rowSum = _mm256_set1_ps(sumY[oy]);
+            const __m256 rowAbs = _mm256_set1_ps(sumAbsY[oy]);
+            const __m256 epsilon = _mm256_set1_ps(1e-6f);
+            const __m256 cancellation = _mm256_set1_ps(0.05f);
+            const __m256 marginVec = _mm256_set1_ps(margin);
+            for (; ox + 8 <= outU.w; ox += 8) {
+                const __m256 weightSum = _mm256_mul_ps(
+                    _mm256_loadu_ps(sumX.data() + ox), rowSum);
+                const __m256 absoluteSum = _mm256_mul_ps(
+                    _mm256_loadu_ps(sumAbsX.data() + ox), rowAbs);
+                const __m256 valid = _mm256_and_ps(
+                    _mm256_cmp_ps(weightSum, epsilon, _CMP_GT_OQ),
+                    _mm256_cmp_ps(weightSum,
+                                  _mm256_mul_ps(cancellation, absoluteSum), _CMP_GE_OQ));
+                if (_mm256_movemask_ps(valid) != 0xff)
+                    break;
+
+                __m256 valueU = _mm256_setzero_ps();
+                __m256 valueV = _mm256_setzero_ps();
+                __m256 minimumU = _mm256_set1_ps(1e30f);
+                __m256 maximumU = _mm256_set1_ps(-1e30f);
+                __m256 minimumV = _mm256_set1_ps(1e30f);
+                __m256 maximumV = _mm256_set1_ps(-1e30f);
+                for (int j = 0; j < ay.sup; ++j) {
+                    if (activity[j] == 0.0f)
+                        continue;
+                    const int y = std::clamp(start + j, 0, U.h - 1);
+                    const int slot = y % horizontalRows;
+                    const __m256 weight = _mm256_set1_ps(weights[j]);
+                    valueU = _mm256_fmadd_ps(
+                        weight, _mm256_loadu_ps(horizontalU.row(slot) + ox), valueU);
+                    minimumU = _mm256_min_ps(
+                        minimumU, _mm256_loadu_ps(horizontalMinU.row(slot) + ox));
+                    maximumU = _mm256_max_ps(
+                        maximumU, _mm256_loadu_ps(horizontalMaxU.row(slot) + ox));
+                    if constexpr (Dual) {
+                        valueV = _mm256_fmadd_ps(
+                            weight, _mm256_loadu_ps(horizontalV.row(slot) + ox), valueV);
+                        minimumV = _mm256_min_ps(
+                            minimumV, _mm256_loadu_ps(horizontalMinV.row(slot) + ox));
+                        maximumV = _mm256_max_ps(
+                            maximumV, _mm256_loadu_ps(horizontalMaxV.row(slot) + ox));
+                    }
+                }
+                valueU = _mm256_div_ps(valueU, weightSum);
+                if (clampHull) {
+                    valueU = _mm256_max_ps(_mm256_sub_ps(minimumU, marginVec),
+                                           _mm256_min_ps(valueU,
+                                               _mm256_add_ps(maximumU, marginVec)));
+                }
+                _mm256_storeu_ps(outU.row(oy) + ox, valueU);
+                if constexpr (Dual) {
+                    valueV = _mm256_div_ps(valueV, weightSum);
+                    if (clampHull) {
+                        valueV = _mm256_max_ps(_mm256_sub_ps(minimumV, marginVec),
+                                               _mm256_min_ps(valueV,
+                                                   _mm256_add_ps(maximumV, marginVec)));
+                    }
+                    _mm256_storeu_ps(outV.row(oy) + ox, valueV);
+                }
+            }
+        }
+#endif
+        for (; ox < outU.w; ++ox) {
+            double valueU = 0.0, valueV = 0.0;
+            float minimumU = 1e30f, maximumU = -1e30f;
+            float minimumV = 1e30f, maximumV = -1e30f;
+            for (int j = 0; j < ay.sup; ++j) {
+                if (activity[j] == 0.0f)
+                    continue;
+                const int y = std::clamp(start + j, 0, U.h - 1);
+                const int slot = y % horizontalRows;
+                valueU += double(weights[j]) * horizontalU.row(slot)[ox];
+                minimumU = std::min(minimumU, horizontalMinU.row(slot)[ox]);
+                maximumU = std::max(maximumU, horizontalMaxU.row(slot)[ox]);
+                if constexpr (Dual) {
+                    valueV += double(weights[j]) * horizontalV.row(slot)[ox];
+                    minimumV = std::min(minimumV, horizontalMinV.row(slot)[ox]);
+                    maximumV = std::max(maximumV, horizontalMaxV.row(slot)[ox]);
+                }
+            }
+            const double weightSum = double(sumX[ox]) * sumY[oy];
+            const double absoluteSum = double(sumAbsX[ox]) * sumAbsY[oy];
+            if (weightSum > 1e-6 && weightSum >= 0.05 * absoluteSum) {
+                valueU /= weightSum;
+                if constexpr (Dual)
+                    valueV /= weightSum;
+            } else {
+                valueU = bilinear(U, ax.pos[ox], ay.pos[oy]);
+                if constexpr (Dual)
+                    valueV = bilinear(V, ax.pos[ox], ay.pos[oy]);
+            }
+            if (clampHull) {
+                valueU = std::clamp(valueU, double(minimumU - margin),
+                                    double(maximumU + margin));
+                if constexpr (Dual)
+                    valueV = std::clamp(valueV, double(minimumV - margin),
+                                        double(maximumV + margin));
+            }
+            outU.row(oy)[ox] = static_cast<float>(valueU);
+            if constexpr (Dual)
+                outV.row(oy)[ox] = static_cast<float>(valueV);
+        }
+    }
+
+    if (metrics) {
+        const uint64_t pixels = uint64_t(outU.w) * outU.h;
+        uint64_t activeHorizontal = 0, activeVertical = 0;
+        for (uint16_t count : ax.activeTaps)
+            activeHorizontal += count;
+        for (uint16_t count : ay.activeTaps)
+            activeVertical += count;
+        const uint64_t taps = horizontalRowsComputed * activeHorizontal +
+                              uint64_t(outU.w) * activeVertical;
+        metrics->outputPixels += pixels;
+        metrics->tapsVisited += taps;
+        metrics->addWork(Stage::BuildBaseChroma, pixels, taps);
+    }
+}
+
+} // namespace
+
+// Plain and guided are explicit paths, but share the exact same cached axis
+// weights, signed-kernel normalization, boundary extension, and hull clamp.
+// Consequently strength=0 remains continuous with strength approaching zero.
 void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
                         const Plane &y, const GuideMaps &gm,
                         int sw, int sh, int cw, int ch,
-                        Plane &cOutU, Plane &cOutV) {
+                        Plane &cOutU, Plane &cOutV,
+                        PipelineMetrics *metrics) {
+    (void)y;
+    (void)gm;
     const double rw = double(sw) / cw, rh = double(sh) / ch;
-    LGCRData d0 = *d;
-    d0.strength = 0.0; // guided=false inside reconstructChroma
-    ChromaJob job;
-    job.srcU = &cb; job.srcV = &cr; job.srcY = &y; job.gm = &gm;
-    job.dstU = &cOutU; job.dstV = &cOutV;
-    job.srcLumaW = sw; job.srcLumaH = sh;
-    job.rw = rw; job.rh = rh; job.shiftX = d->shiftX; job.shiftY = d->shiftY;
-    job.d = &d0;
-    reconstructChroma(job);
+    const auto ax = cachedChromaAxis(d, sw, cOutU.w, rw, d->shiftX);
+    const auto ay = cachedChromaAxis(d, sh, cOutU.h, rh, d->shiftY);
+    if (d->radial) {
+        const auto radialWeights = cachedRadialWeights(d, *ax, *ay, cb.w, cb.h);
+        plainChromaImpl<NativeBackend, true>(*d, cb, cr, cOutU, cOutV,
+                                             *ax, *ay, radialWeights.get(), metrics);
+    } else if (d->kernel == Kernel::Bilinear)
+        plainChromaBilinear<NativeBackend, true>(cb, cr, cOutU, cOutV,
+                                                 *ax, *ay, metrics);
+    else
+        plainChromaSeparable<NativeBackend, true>(
+            *d, cb, cr, cOutU, cOutV, *ax, *ay, metrics);
+}
+
+void plainPlane(const LGCRData *d, const Plane &src,
+                int sw, int sh, int cw, int ch, Plane &dst) {
+    const double rw = double(sw) / cw, rh = double(sh) / ch;
+    const auto ax = cachedChromaAxis(d, sw, dst.w, rw, d->shiftX);
+    const auto ay = cachedChromaAxis(d, sh, dst.h, rh, d->shiftY);
+    if (d->radial) {
+        const auto radialWeights = cachedRadialWeights(d, *ax, *ay, src.w, src.h);
+        plainChromaImpl<NativeBackend, false>(*d, src, src, dst, dst,
+                                              *ax, *ay, radialWeights.get(), nullptr);
+    } else if (d->kernel == Kernel::Bilinear)
+        plainChromaBilinear<NativeBackend, false>(src, src, dst, dst,
+                                                  *ax, *ay, nullptr);
+    else
+        plainChromaSeparable<NativeBackend, false>(
+            *d, src, src, dst, dst, *ax, *ay, nullptr);
 }
 
 // LGF coefficient planes for the internal algo=4 selector branch.
@@ -637,8 +1357,11 @@ void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
 LGFMaps buildLGFMaps(const LGCRData *d, const Plane &y, const Plane &cb,
                             const Plane &cr, int cw, int ch, double rw, double rh) {
     LGFMaps m(cw, ch);
-    buildLGF(y, cw, ch, rw, rh, d->shiftX, d->shiftY, cb, 2, d->reg * d->reg, m.aU, m.bU, m.confU, d->cedge);
-    buildLGF(y, cw, ch, rw, rh, d->shiftX, d->shiftY, cr, 2, d->reg * d->reg, m.aV, m.bV, m.confV, d->cedge);
+    // buildLGFPair lives in algos.cpp so both chroma planes share luma samples
+    // and a single rolling-window traversal.
+    buildLGFPair(y, cw, ch, rw, rh, d->shiftX, d->shiftY, cb, cr, 2,
+                 d->reg * d->reg, m.aU, m.bU, m.confU,
+                 m.aV, m.bV, m.confV, d->cedge);
     return m;
 }
 

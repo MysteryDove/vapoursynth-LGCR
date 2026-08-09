@@ -7,12 +7,20 @@
 #include <VSHelper4.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <new>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
+
+#include "pipeline.h"
+#include "backend.h"
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -23,6 +31,9 @@
 #endif
 
 namespace lgcr {
+
+struct GeometryCache;
+std::shared_ptr<GeometryCache> makeGeometryCache();
 
 // ---------------------------------------------------------------------------
 // Kernels
@@ -139,15 +150,53 @@ struct LGCRData {
     double arMargin = 0.0;           // anti-ringing hull margin (<0 disables)
     double shiftX = -0.5;            // src chroma siting, luma units ("left")
     double shiftY = 0.0;             // vertical siting (from _ChromaLocation / loc)
+    // Shared across frame requests, including temporary per-frame siting
+    // copies. The cache is filter-instance local and internally locked.
+    std::shared_ptr<GeometryCache> geometryCache = makeGeometryCache();
 };
 
 // ---------------------------------------------------------------------------
 // Small float plane helper
 // ---------------------------------------------------------------------------
 
+template <class T>
+struct NoInitAllocator {
+    using value_type = T;
+
+    NoInitAllocator() noexcept = default;
+    template <class U>
+    NoInitAllocator(const NoInitAllocator<U> &) noexcept {}
+
+    T *allocate(size_t count) {
+        return std::allocator<T>{}.allocate(count);
+    }
+    void deallocate(T *pointer, size_t count) noexcept {
+        std::allocator<T>{}.deallocate(pointer, count);
+    }
+    template <class U>
+    void construct(U *pointer) {
+        ::new (static_cast<void *>(pointer)) U;
+    }
+    template <class U, class... Args>
+    void construct(U *pointer, Args &&...args) {
+        ::new (static_cast<void *>(pointer)) U(std::forward<Args>(args)...);
+    }
+    template <class U>
+    struct rebind { using other = NoInitAllocator<U>; };
+};
+
+template <class T, class U>
+bool operator==(const NoInitAllocator<T> &, const NoInitAllocator<U> &) noexcept {
+    return true;
+}
+template <class T, class U>
+bool operator!=(const NoInitAllocator<T> &, const NoInitAllocator<U> &) noexcept {
+    return false;
+}
+
 struct Plane {
     int w = 0, h = 0, stride = 0;
-    std::vector<float> px;
+    std::vector<float, NoInitAllocator<float>> px;
 
     Plane() = default;
     Plane(int w_, int h_) : w(w_), h(h_), stride(w_) { px.resize(size_t(stride) * h); }
@@ -179,6 +228,12 @@ inline float bilinear(const Plane &p, double x, double y) {
 // Precomputed bilinear sampling axis: clamped index + fraction per output
 // sample, so per-pixel guide sampling needs no branches or clamps.
 struct BilinAxis {
+    struct Phase2x {
+        bool enabled = false;
+        int simdBegin = 0;
+        int simdEnd = 0;
+        std::array<float, 2> fraction{{0.0f, 0.0f}};
+    } phase2x;
     int n = 0;
     std::vector<int> i0;
     std::vector<float> f;
@@ -203,6 +258,36 @@ inline float bilinearFast(const Plane &p, int x0, float fx, int y0, float fy) {
     return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
 }
 
+struct TensorDirection {
+    float coherence = 0.0f;
+    float nx = 1.0f;
+    float ny = 0.0f;
+};
+
+inline TensorDirection principalTensorDirection(float jxx, float jxy, float jyy) {
+    TensorDirection direction;
+    const float difference = jxx - jyy;
+    const float sum = jxx + jyy;
+    const float cross = 2.0f * jxy;
+    const float discriminant = std::sqrt(difference * difference + cross * cross);
+    direction.coherence = discriminant / (sum + 1e-12f);
+    if (discriminant <= 1e-20f)
+        return direction;
+
+    float vx, vy;
+    if (difference >= 0.0f) {
+        vx = discriminant + difference;
+        vy = cross;
+    } else {
+        vx = cross;
+        vy = discriminant - difference;
+    }
+    const float inverseLength = 1.0f / std::sqrt(vx * vx + vy * vy);
+    direction.nx = vx * inverseLength;
+    direction.ny = vy * inverseLength;
+    return direction;
+}
+
 // ---------------------------------------------------------------------------
 // Luma structure maps (maps.cpp)
 // ---------------------------------------------------------------------------
@@ -216,12 +301,14 @@ struct GuideMaps {
 };
 
 GuideMaps buildGuideMaps(const Plane &structY, const Plane &lcY, int cw, int ch,
-                         double rw, double rh, double shiftX, double shiftY);
+                         double rw, double rh, double shiftX, double shiftY,
+                         PipelineMetrics *metrics = nullptr);
 
 // Mutual-structure co-edge gate at chroma res (maps.cpp). rho-correlation of
 // luma/chroma gradient profiles along the luma edge normal; 1 = confirmed
 // co-edge (direction + position + width agree), 0 = no chroma-side evidence.
-Plane buildMutualGate(const Plane &lc, const Plane &U, const Plane &V, double sigma);
+Plane buildMutualGate(const Plane &lc, const Plane &U, const Plane &V, double sigma,
+                      const uint8_t *activeMask = nullptr, int activeStride = 0);
 
 // Footprint-averaged luma at each chroma sample (standalone, for TRecon).
 Plane buildLcMap(const Plane &lcY, int cw, int ch, double rw, double rh,
@@ -231,6 +318,11 @@ Plane buildLcMap(const Plane &lcY, int cw, int ch, double rw, double rh,
 // kind 0 = box footprint (== buildLcMap), 1 = triangle/bilinear, 2 = bicubic.
 Plane buildYcMap(const Plane &Y, int cw, int ch, double rw, double rh,
                  double shiftX, double shiftY, int kind);
+
+std::array<Plane, 3> buildYcMaps(const LGCRData *owner, const Plane &Y, int cw, int ch,
+                                 double rw, double rh,
+                                 double shiftX, double shiftY,
+                                 PipelineMetrics *metrics = nullptr);
 
 // Sparse trust mask: 1 where the output pixel's support window may touch a
 // luma structure worth guiding by (tensor energy over threshold), dilated by
@@ -244,7 +336,7 @@ std::vector<uint8_t> buildTrustMask(const GuideMaps &gm, int outW, int outH,
 
 struct WeightTable {
     int n = 0;              // number of output samples
-    int sup = 0;            // taps per sample (fixed, padded to multiple of 8)
+    int sup = 0;            // exact taps per sample (2/4/6/8 for fixed kernels)
     std::vector<int> start; // first source tap index per output sample
     std::vector<float> w;   // n * sup weights, normalized
 };
@@ -291,6 +383,7 @@ void resampleRadial(const Plane &src, Plane &dst, const LGCRData &d);
 // ---------------------------------------------------------------------------
 
 struct TemporalNbr;
+struct LGFMaps;
 
 struct ChromaJob {
     const Plane *srcU, *srcV;  // source chroma (chroma res)
@@ -301,13 +394,15 @@ struct ChromaJob {
     double rw, rh;             // luma/chroma ratio (subsample factors)
     double shiftX, shiftY;     // src chroma siting, luma units
     const LGCRData *d;
-    Plane *selW2 = nullptr;    // selector output: per-pixel weight for the
-    Plane *selW3 = nullptr;    //   sim path (w2) and the LGF path (w3)
+    const LGFMaps *selectorMaps = nullptr; // optional fused algo4 selector
+    float selectorStrength = 0.0f;
     const uint8_t *mask = nullptr; // sparse trust mask (SOURCE luma res, row-major);
     int maskW = 0, maskH = 0;      //   mask dimensions (indexed by mapped coords)
     const Plane *plainU = nullptr; //   pixels with mask==0 keep plainU/plainV
     const Plane *plainV = nullptr; //   (dst must be pre-filled with them)
     const std::vector<TemporalNbr> *nbrs = nullptr; // temporal taps (TRecon)
+    PipelineMetrics *metrics = nullptr; // optional per-frame profiling counters
+    Stage metricStage = Stage::ApplyGuidedCorrection;
 };
 
 // One motion-compensated neighbor frame for TRecon. Motion is integer-pel
@@ -325,17 +420,53 @@ struct TemporalNbr {
 // Per-output-x precomputed data: chroma source position, base weights, tap start
 struct ChromaAxis {
     int n = 0;
-    int sup = 0;               // padded to multiple of 8
+    int sup = 0;               // exact logical support; SIMD tails are local
     std::vector<int> start;    // first tap (clamped-safe range handled at load)
     std::vector<float> w;      // base kernel weights, n * sup
-    std::vector<float> am;     // tap activity mask, n * sup: 1.0 inside the logical
-                               //   kernel support, 0.0 for SIMD padding taps
+    std::vector<float> am;     // tap activity mask, n * sup: 1 inside the
+                               // logical kernel support, otherwise 0
+    std::vector<float> tapWeights;  // active weights transposed as sup * n
+    std::vector<float> tapActivity; // activity transposed as sup * n
+    std::vector<float> weightSum;
+    std::vector<float> absoluteWeightSum;
+    std::vector<uint16_t> activeTaps;
     std::vector<float> pos;    // source center position per output sample (chroma units)
     std::vector<float> lpos;   // source center position per output sample (luma units)
+    BilinAxis chromaBilin;     // pos mapped to the source chroma grid
+    BilinAxis lumaBilin;       // lpos mapped to the source luma grid
+};
+
+struct RadialWeightTable {
+    int supportX = 0, supportY = 0;
+    int phaseCountX = 0, phaseCountY = 0;
+    std::vector<uint16_t> xPhase;
+    std::vector<uint16_t> yPhase;
+    std::vector<float> weights;
+    std::vector<double> weightSum;
+    std::vector<double> absoluteWeightSum;
+
+    size_t phaseAt(int x, int y) const {
+        return size_t(yPhase[y]) * phaseCountX + xPhase[x];
+    }
+
+    const float *at(int x, int y) const {
+        if (weights.empty())
+            return nullptr;
+        return weights.data() + phaseAt(x, y) * supportX * supportY;
+    }
 };
 
 ChromaAxis buildChromaAxis(int srcLumaN, int dstLumaN, double r, double sitShift,
                            const LGCRData *d);
+
+std::shared_ptr<const WeightTable> cachedWeights(const LGCRData *d, int srcN,
+                                                 int dstN, double shift);
+std::shared_ptr<const ChromaAxis> cachedChromaAxis(const LGCRData *d,
+                                                   int srcLumaN, int dstLumaN,
+                                                   double r, double sitShift);
+std::shared_ptr<const RadialWeightTable> cachedRadialWeights(
+    const LGCRData *d, const ChromaAxis &ax, const ChromaAxis &ay,
+    int sourceWidth, int sourceHeight);
 
 void reconstructChroma(const ChromaJob &job);
 
@@ -345,7 +476,11 @@ void reconstructChroma(const ChromaJob &job);
 void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
                  const Plane &y, const GuideMaps &gm,
                  int sw, int sh, int cw, int ch,
-                 Plane &cOutU, Plane &cOutV);
+                 Plane &cOutU, Plane &cOutV,
+                 PipelineMetrics *metrics = nullptr);
+
+void plainPlane(const LGCRData *d, const Plane &src,
+                int sw, int sh, int cw, int ch, Plane &dst);
 
 // ---------------------------------------------------------------------------
 // Alternative algorithms (algos.cpp)
@@ -354,6 +489,7 @@ void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
 // Internal LGF coefficient planes for the algo=4 selector branch.
 struct LGFMaps {
     Plane aU, bU, confU, aV, bV, confV;
+    LGFMaps() = default;
     LGFMaps(int cw, int ch) : aU(cw, ch), bU(cw, ch), confU(cw, ch),
                               aV(cw, ch), bV(cw, ch), confV(cw, ch) {}
 };
@@ -361,6 +497,12 @@ struct LGFMaps {
 void buildLGF(const Plane &Y, int cw, int ch, double rw, double rh,
               double shiftX, double shiftY, const Plane &C, int radius, double eps,
               Plane &a, Plane &b, Plane &conf, bool cedge);
+
+void buildLGFPair(const Plane &Y, int cw, int ch, double rw, double rh,
+                  double shiftX, double shiftY, const Plane &U, const Plane &V,
+                  int radius, double eps,
+                  Plane &aU, Plane &bU, Plane &confU,
+                  Plane &aV, Plane &bV, Plane &confV, bool cedge);
 
 LGFMaps buildLGFMaps(const LGCRData *d, const Plane &y, const Plane &cb,
                      const Plane &cr, int cw, int ch, double rw, double rh);
@@ -396,11 +538,16 @@ struct AffineMaps {
     Plane detail;      // constrained luma detail, resampled to output space
     Plane mnU, mxU, mnV, mxV; // 5x5 window hull per plane (chroma res)
     Plane rng;         // max(U,V) window range, for the magnitude cap
+    Plane degradedLuma; // consensus D(Y), consumed by BuildDetail
     AffineMaps() = default;
 };
 
 AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
-                           const Plane &cr, int cw, int ch, double rw, double rh);
+                           const Plane &cr, int cw, int ch, double rw, double rh,
+                           PipelineMetrics *metrics = nullptr);
+
+void buildDetailMap(const LGCRData *d, const Plane &y, int cw, int ch,
+                    double rw, double rh, AffineMaps &maps);
 
 void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
                     const AffineMaps &af, const GuideMaps &gm,
