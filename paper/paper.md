@@ -3,7 +3,9 @@
 **MysteryDove**  
 [github.com/MysteryDove](https://github.com/MysteryDove)
 
-Working paper, version 0.1, 2026-08-08
+Working paper, version 0.1, 2026-08-09
+
+Reference revision: Git tag `paper-v0.1`.
 
 > Status: the controlled synthetic study is reproducible, but the licensed
 > animation/natural-image corpus is not yet populated. This draft does not

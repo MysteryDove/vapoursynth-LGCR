@@ -2,6 +2,8 @@ cff-version: 1.2.0
 message: "If you use this software or benchmark, please cite the working paper."
 title: "LGCR: Luma-Guided Chroma Reconstruction"
 type: software
+version: "0.1"
+date-released: 2026-08-09
 authors:
   - name: MysteryDove
 repository-code: "https://github.com/MysteryDove/vapoursynth-LGCR"
@@ -12,4 +14,4 @@ preferred-citation:
   authors:
     - name: MysteryDove
   year: 2026
-  url: "https://github.com/MysteryDove/vapoursynth-LGCR/blob/main/paper/paper.md"
+  url: "https://github.com/MysteryDove/vapoursynth-LGCR/blob/paper-v0.1/paper/paper.md"

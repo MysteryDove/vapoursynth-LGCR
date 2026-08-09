@@ -397,6 +397,15 @@ def main() -> None:
         failures.append("CITATION.cff: expected MysteryDove in software and paper authors")
     if "From 4:2:0 Sampling to Color Bleed" not in citation:
         failures.append("CITATION.cff: preferred paper citation is missing")
+    if "version: \"0.1\"" not in citation:
+        failures.append("CITATION.cff: paper release version is not 0.1")
+    if "/blob/paper-v0.1/paper/paper.md" not in citation:
+        failures.append("CITATION.cff: preferred paper URL is not tag-pinned")
+    require(
+        "Reference revision: Git tag `paper-v0.1`.",
+        "paper tag reference",
+        compact=True,
+    )
 
     required_caveats = (
         "This draft does not support a claim about prevalence or subjective benefit on released animation.",
