@@ -7,31 +7,63 @@ VSINCLUDE ?= $(HOME)/vapoursynth/lib/python3.14/site-packages/vapoursynth/includ
 CXX      ?= g++
 CXXFLAGS ?= -O3 -std=c++17 -fPIC -Wall -Wextra -mavx2 -mfma
 LDFLAGS  ?= -shared
+LDLIBS   ?=
 
-SRCS    := src/maps.cpp src/kernels.cpp src/recon.cpp src/algos.cpp src/plugin.cpp
+LGCR_ENABLE_CUDA ?= 0
+CUDA_ROOT ?= /usr/local/cuda
+
+ifeq ($(LGCR_ENABLE_CUDA),1)
+CPPFLAGS += -DLGCR_ENABLE_CUDA=1 -I$(CUDA_ROOT)/include
+LDLIBS += -L$(CUDA_ROOT)/lib64 -Wl,-rpath,$(CUDA_ROOT)/lib64 -lcudart
+else
+CPPFLAGS += -DLGCR_ENABLE_CUDA=0
+endif
+
+SRCS    := src/pipeline.cpp src/cuda_backend.cpp src/maps.cpp src/kernels.cpp src/recon.cpp src/algos.cpp src/plugin.cpp
 OBJS    := $(SRCS:.cpp=.o)
-HDR     := src/lgcr.h
+HDR     := $(wildcard src/*.h)
 
 TARGET  := liblgcr.so
 PYTHON  ?= $(HOME)/vapoursynth/bin/python3
+BENCHMARK_ARGS ?=
 ASAN_FLAGS := -O1 -g -std=c++17 -fPIC -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer
+BUILD_CONFIG := .lgcr-build-config
 
 all: $(TARGET)
 
-$(TARGET): $(SRCS) $(HDR)
-	$(CXX) $(CXXFLAGS) -I$(VSINCLUDE) $(LDFLAGS) -o $@ $(SRCS)
+$(BUILD_CONFIG): FORCE
+	@value='cuda=$(LGCR_ENABLE_CUDA);cuda_root=$(CUDA_ROOT);cxx=$(CXX);cxxflags=$(CXXFLAGS)'; \
+	current="$$(test -f $@ && sed -n '1p' $@)"; \
+	if test "$$current" != "$$value"; then printf '%s\n' "$$value" > $@; fi
+
+$(TARGET): $(SRCS) $(HDR) $(BUILD_CONFIG)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -I$(VSINCLUDE) $(LDFLAGS) -o $@ $(SRCS) $(LDLIBS)
 
 # Scalar reference build (no AVX2) for correctness cross-checking
-liblgcr_scalar.so: $(SRCS) $(HDR)
-	$(CXX) -O3 -std=c++17 -fPIC -Wall -Wextra -DLGCR_SUFFIX='"_scalar"' -I$(VSINCLUDE) -shared -o $@ $(SRCS)
+liblgcr_scalar.so: $(SRCS) $(HDR) $(BUILD_CONFIG)
+	$(CXX) $(CPPFLAGS) -O3 -std=c++17 -fPIC -Wall -Wextra -DLGCR_SUFFIX='"_scalar"' -I$(VSINCLUDE) -shared -o $@ $(SRCS) $(LDLIBS)
 
-liblgcr_asan.so: $(SRCS) $(HDR)
-	$(CXX) $(ASAN_FLAGS) -I$(VSINCLUDE) -shared -o $@ $(SRCS)
+liblgcr_asan.so: $(SRCS) $(HDR) $(BUILD_CONFIG)
+	$(CXX) $(CPPFLAGS) $(ASAN_FLAGS) -I$(VSINCLUDE) -shared -o $@ $(SRCS) $(LDLIBS)
 
-check: $(TARGET) liblgcr_scalar.so
+test/test_pipeline: test/test_pipeline.cpp src/pipeline.cpp src/cuda_backend.cpp src/pipeline.h src/cuda_backend.h
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -DLGCR_ENABLE_CUDA=0 -Isrc -o $@ test/test_pipeline.cpp src/pipeline.cpp src/cuda_backend.cpp
+
+pipeline-check: test/test_pipeline
+	./test/test_pipeline
+
+cuda-framework-check:
+	$(CXX) -O2 -std=c++17 -Wall -Wextra -DLGCR_ENABLE_CUDA=1 -Isrc \
+		-I$(CUDA_ROOT)/include -o test/test_pipeline_cuda test/test_pipeline.cpp \
+		src/pipeline.cpp src/cuda_backend.cpp -L$(CUDA_ROOT)/lib64 \
+		-Wl,-rpath,$(CUDA_ROOT)/lib64 -lcudart
+	./test/test_pipeline_cuda
+
+check: $(TARGET) liblgcr_scalar.so pipeline-check
 	$(PYTHON) test/test_lgcr.py
 	$(PYTHON) test/test_algo6.py
 	$(PYTHON) test/test_regressions.py
+	$(PYTHON) test/test_backend_matrix.py
 	$(PYTHON) test/battery.py --all --check
 	$(PYTHON) -m evaluation.test_protocol
 	$(PYTHON) -m evaluation.check_paper
@@ -70,11 +102,17 @@ eval-corpora:
 
 eval-results: eval-dev eval-test eval-ablation eval-siting eval-phase
 
+benchmark: $(TARGET)
+	$(PYTHON) test/benchmark.py $(BENCHMARK_ARGS)
+
 asan-check: liblgcr_asan.so
 	ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 \
 	LGCR_PLUGIN="$(CURDIR)/liblgcr_asan.so" $(PYTHON) test/test_regressions.py --asan
 
 clean:
-	rm -f $(TARGET) liblgcr_scalar.so liblgcr_asan.so src/*.o
+	rm -f $(TARGET) liblgcr_scalar.so liblgcr_asan.so test/test_pipeline \
+		test/test_pipeline_cuda $(BUILD_CONFIG) src/*.o
 
-.PHONY: all check paper-check asan-check eval-dev eval-test eval-ablation eval-siting eval-phase eval-kernels eval-kernel-confirm eval-kernel-study eval-wada-confirm eval-corpora eval-results clean
+.PHONY: all check pipeline-check cuda-framework-check paper-check asan-check benchmark eval-dev eval-test eval-ablation eval-siting eval-phase eval-kernels eval-kernel-confirm eval-kernel-study eval-wada-confirm eval-corpora eval-results clean FORCE
+
+FORCE:

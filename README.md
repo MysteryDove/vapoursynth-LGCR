@@ -16,6 +16,11 @@ The scalar build does not require AVX2 or FMA.
 Tests and evaluation additionally require Python 3, NumPy, and Pillow in the
 VapourSynth Python environment.
 
+CUDA is optional. The first CUDA-enabled release provides the device-buffer,
+stream, stage-dispatch, timing, and CPU-fallback framework; compute kernels are
+being connected stage by stage, so the VapourSynth filter still selects the CPU
+backend by default.
+
 ## Build
 
 The Makefile defaults to the header path under `~/vapoursynth`. Override
@@ -31,12 +36,52 @@ This creates `liblgcr.so`. To build the scalar reference plugin as well:
 make liblgcr_scalar.so VSINCLUDE=/path/to/vapoursynth/include
 ```
 
+To compile the optional CUDA framework against a CUDA toolkit:
+
+```sh
+make LGCR_ENABLE_CUDA=1 CUDA_ROOT=/usr/local/cuda
+make cuda-framework-check CUDA_ROOT=/usr/local/cuda
+```
+
+With `LGCR_ENABLE_CUDA=0` (the default), no CUDA headers, runtime, or device are
+required. CUDA availability does not change the public VapourSynth API.
+
 To run the test suite, set `PYTHON` if VapourSynth is not installed in the
 default local environment:
 
 ```sh
 make check PYTHON=/path/to/vapoursynth/bin/python3
 ```
+
+For a quick repeatable public-boundary performance baseline, run:
+
+```sh
+make benchmark PYTHON=/path/to/vapoursynth/bin/python3
+```
+
+The benchmark emits JSONL records per frame and per-case summaries. Records
+include wall time, internal stage times, checksums, process memory, stage pixel
+and tap counts, sparse-mask hit rate, and optional AVX2/scalar maximum error.
+Every measured request uses a distinct frame number to avoid frame-cache hits.
+
+The full 1080p/4K, 420/422/444, kernel, algorithm, sparse, and gate matrix is:
+
+```sh
+make benchmark BENCHMARK_ARGS="--preset full --iterations 3 --output baseline.jsonl"
+```
+
+Compare a later run with `--baseline baseline.jsonl`; summary records include
+the resulting speedup. The checked-in pre-framework smoke reference can be
+used on the original Ryzen 9 5950X host with:
+
+```sh
+make benchmark BENCHMARK_ARGS="--preset smoke --iterations 5 --baseline test/baselines/lgcr-smoke-pre-framework.jsonl --output current.jsonl"
+```
+
+Performance baselines are host- and toolchain-specific; use the checked-in
+file as an informational reference or generate a fresh local baseline before
+tuning. Add `--compare-scalar` after building `liblgcr_scalar.so` to record
+backend error.
 
 ## Load The Plugin
 

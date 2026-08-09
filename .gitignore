@@ -1,6 +1,9 @@
 # Build artifacts
 *.so
 *.o
+.lgcr-build-config
+test/test_pipeline
+test/test_pipeline_cuda
 
 # Python
 __pycache__/
