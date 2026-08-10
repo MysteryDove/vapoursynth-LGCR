@@ -11,6 +11,11 @@ LDLIBS   ?=
 
 LGCR_ENABLE_CUDA ?= 0
 CUDA_ROOT ?= /usr/local/cuda
+LGCR_VERSION_MAJOR ?= 1
+LGCR_VERSION_MINOR ?= 0
+
+CPPFLAGS += -DLGCR_VERSION_MAJOR=$(LGCR_VERSION_MAJOR) \
+	-DLGCR_VERSION_MINOR=$(LGCR_VERSION_MINOR)
 
 ifeq ($(LGCR_ENABLE_CUDA),1)
 CPPFLAGS += -DLGCR_ENABLE_CUDA=1 -I$(CUDA_ROOT)/include
@@ -32,7 +37,7 @@ BUILD_CONFIG := .lgcr-build-config
 all: $(TARGET)
 
 $(BUILD_CONFIG): FORCE
-	@value='cuda=$(LGCR_ENABLE_CUDA);cuda_root=$(CUDA_ROOT);cxx=$(CXX);cxxflags=$(CXXFLAGS)'; \
+	@value='cuda=$(LGCR_ENABLE_CUDA);cuda_root=$(CUDA_ROOT);version=$(LGCR_VERSION_MAJOR).$(LGCR_VERSION_MINOR);cxx=$(CXX);cxxflags=$(CXXFLAGS)'; \
 	current="$$(test -f $@ && sed -n '1p' $@)"; \
 	if test "$$current" != "$$value"; then printf '%s\n' "$$value" > $@; fi
 

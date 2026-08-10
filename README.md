@@ -5,6 +5,17 @@ provides same-size chroma upsampling, combined resize and reconstruction,
 optional temporal reconstruction, and edge-aware sharpening for planar YUV
 clips.
 
+This repository is the source distribution. Release assets are pre-built for
+Linux x86-64 and Windows x86-64; choose the asset matching the host CPU and
+keep VapourSynth's `_ChromaLocation` frame property when possible.
+
+## Visual Example
+
+The comparison below shows the same crop from left to right: **Original**,
+**Plain** reconstruction (`strength=0`), and **LGCR** reconstruction.
+
+![LGCR comparison: Original | Plain | LGCR](compare_coat.png)
+
 ## Requirements
 
 - VapourSynth R55 or newer with API v4 headers
@@ -308,6 +319,65 @@ matching is not desired.
 | `sparse` | `0` | Sparse guided-work toggle |
 | `ms` | `1.0` | Mutual-structure gate strength, `0..1` |
 
+## Parameter Tuning Guide
+
+Start with the defaults and change one parameter at a time. Compare against
+`strength=0` (plain reconstruction) on a short representative clip. These
+are practical directions, not quality guarantees; extreme values can trade
+ringing, softness, and false colour.
+
+### Recon
+
+| If you see / need | Try | What to expect |
+|---|---|---|
+| More detail is still missing at chroma edges | `strength` up (towards `1`) | More luma guidance; can copy luma noise or create colour halos |
+| False colour or luma texture is leaking into chroma | Lower `strength`; lower `sigma`/`sratio` | Tighter luma matching and a plainer result; too low can reject useful neighbours |
+| Smooth ramps fragment or remain aliased | Raise `sdb` slightly | Broader matching on ramps; too high can smear transitions |
+| Diagonals or mixed edge types need a better choice | `algo=4` | Selects among guided, regression, and plain candidates; slower than `algo=2` |
+| You want crisp detail transfer after reconstruction | `algo=6`; adjust `qgate` | Transfers detail only when its affine fit is credible; lower `qgate` is more permissive |
+| Thin lines break or disappear | Keep `ridge=1`; raise `rescue` | Protects ridge/phase-zero structure; may retain more noise |
+| Wide chroma transitions look over-sharpened | Try `cedge=1` | Experimental transition fade; validate on the target material |
+| Edge support is too isotropic or too broad along an edge | Adjust `stretch` (0 is isotropic) and `gsigma` | Higher values extend/soften support and can reduce locality |
+| Flat areas are slow with little visible change | Keep `sparse=1` | Skips guidance away from luma structure; set `0` for debugging/A-B parity |
+| Output rings or overshoots the local chroma range | Lower `ar` towards `0` | Tightens the local hull clamp; higher values allow more overshoot and negative disables clamping |
+| Regression modes are unstable/noisy | Raise `reg` | Stronger regularization for `algo=4/6`, at the cost of detail |
+| 4:2:0 average is not preserved after same-size reconstruction | Raise `bp` from `0` towards `1` | Adds data-consistency back-projection; too high can flatten edges |
+| Chroma edges are shifted left/right | Set `loc="left"` or `loc="center"`, or fix `_ChromaLocation` | Correct siting before tuning quality parameters; `loc` only controls horizontal siting |
+| Resizing changes the character of the result | Try `kernel` and `taps` | `bilinear` is soft, `bicubic` is tunable with `b/c`, higher Lanczos/Jinc taps are sharper and slower |
+
+`b` and `c` only affect `kernel="bicubic"`: increase `b` for a smoother,
+less ringing response; increase `c` for a sharper response. Keep both near
+their conventional range and check overshoot. `ms` reduces guidance when
+luma/chroma structure disagrees; lower it when textured chroma is being
+suppressed, and raise it when false structure is appearing. `sigma` is the
+absolute similarity floor, while `sratio` scales with the local luma range.
+Higher values accept larger luma differences; lower values reject them.
+
+### Sharpen
+
+| If you see / need | Try | What to expect |
+|---|---|---|
+| Reconstructed chroma is too soft | Raise `alpha` in small steps | More edge contrast; ringing/noise also increases |
+| Sharpening catches noise or texture | Lower `alpha`; lower `sigma`/`sratio` | Tighter luma similarity reduces unrelated high-pass detail |
+| The effect is too local or too broad | Adjust `gspatial` | Larger values spread the spatial support and soften the gate |
+| Overshoot appears at colour boundaries | Lower `ar` towards `0` | Tightens the local hull clamp; negative disables clamping |
+
+### TRecon
+
+| If you see / need | Try | What to expect |
+|---|---|---|
+| Static noise remains | Raise `trad` (up to `8`) | Uses more neighbouring frames; costs memory/time |
+| Motion is missed | Raise `tsearch` (up to `64`) | Finds larger integer motion; costs time and can match the wrong block |
+| Valid temporal matches are being rejected | Raise `tsad` slightly | Makes the confidence gate more permissive; too high can ghost |
+| Motion matches are unstable or ghost | Lower `tsad`; lower `trad` | Rejects weaker matches / uses fewer frames |
+| Temporal result is too guided or too soft | Adjust `strength`, `sigma`, `sratio`, `sdb`, `gsigma`, `stretch`, `ridge`, `ar`, and `ms` as in `Recon` | TRecon uses the fixed algo-2 Lanczos3 spatial base |
+| Flat areas need temporal averaging | Keep `sparse=0` | `sparse=1` saves guided work but skips corrections away from luma structure |
+| A single-frame or variable-length clip is used | Use `Recon` instead | TRecon requires constant dimensions and a known frame count |
+
+For a first pass, use `Recon(src)` for stills and `TRecon(src, trad=1)` for
+stable video. Tune siting and the base kernel before changing algorithmic
+gates. Always inspect animation line art and natural-texture shots separately.
+
 ## Output And Encoding
 
 `Recon` and `TRecon` return 4:4:4. Convert back to 4:2:0 only when required by
@@ -338,3 +408,14 @@ interpreter:
 ```sh
 make eval-results PYTHON=/path/to/vapoursynth/bin/python3
 ```
+
+## Releasing
+
+Maintainers can run the `release` workflow from the GitHub Actions page. Select
+the source ref, enter a new `vMAJOR.MINOR.PATCH` tag, and optionally mark it as
+a pre-release. The workflow runs the Linux checks, builds Linux and Windows
+assets, and creates the tag and GitHub Release only after both builds succeed.
+
+## License
+
+LGCR is available under the [MIT License](LICENSE).

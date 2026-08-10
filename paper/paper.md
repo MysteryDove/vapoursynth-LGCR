@@ -800,8 +800,9 @@ soft chroma. This identifies conditional combination as a testable next step,
 not as a validated replacement method.
 
 The controlled study is technically ready for a transparent GitHub working-
-paper release, but the repository still needs explicit licenses and a versioned
-archival release. It is not ready to claim effectiveness on released animation.
+paper release, and the repository includes an explicit MIT license, but it
+still needs a versioned archival release. It is not ready to claim
+effectiveness on released animation.
 That claim requires the licensed real-domain and subjective evaluation
 specified in the publication plan.
 

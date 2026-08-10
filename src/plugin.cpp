@@ -2,6 +2,13 @@
 
 #include <cstdlib>
 
+#ifndef LGCR_VERSION_MAJOR
+#define LGCR_VERSION_MAJOR 1
+#endif
+#ifndef LGCR_VERSION_MINOR
+#define LGCR_VERSION_MINOR 0
+#endif
+
 using namespace lgcr;
 
 static const VSFrame *VS_CC sharpenGetFrame(int n, int activationReason, void *instanceData,
@@ -955,7 +962,8 @@ VS_EXTERNAL_API(void)
 VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     vspapi->configPlugin("dev.bsflab.lgcr" LGCR_SUFFIX, "lgcr" LGCR_SUFFIX,
                          "Luma-guided chroma reconstruction with direction-aware kernels",
-                         VS_MAKE_VERSION(1, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+                         VS_MAKE_VERSION(LGCR_VERSION_MAJOR, LGCR_VERSION_MINOR),
+                         VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction(
         "Recon",
         "clip:vnode;width:int:opt;height:int:opt;kernel:data:opt;taps:int:opt;algo:int:opt;"
