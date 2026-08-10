@@ -108,6 +108,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
       - uses: actions/download-artifact@v4
         with:
           pattern: lgcr-*
@@ -116,10 +119,11 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
           SHA: ${{ needs.prepare.outputs.sha }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
-          args=("$TAG" dist/* --target "$SHA" --title "LGCR $TAG" --generate-notes)
+          args=("$TAG" dist/* --target "$SHA" --title "LGCR $TAG" --notes-file RELEASE_NOTES.md)
           if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
           gh release create "${args[@]}"
