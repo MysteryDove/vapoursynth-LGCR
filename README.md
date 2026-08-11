@@ -1,9 +1,9 @@
 # LGCR
 
 LGCR is a VapourSynth 4 plugin for luma-guided chroma reconstruction. It
-provides same-size chroma upsampling, guided 4:4:4 to 4:2:0 downsampling,
-combined resize and reconstruction, optional temporal reconstruction, and
-edge-aware sharpening for planar YUV clips.
+provides same-size chroma upsampling, combined resize and reconstruction,
+optional temporal reconstruction, and edge-aware sharpening for planar YUV
+clips and it works well with chroma-aliasing and chroma-bleeding in animation.
 
 This repository is the source distribution. Release assets are pre-built for
 Linux x86-64 and Windows x86-64; choose the asset matching the host CPU and
