@@ -3,10 +3,10 @@
 #include <cstdlib>
 
 #ifndef LGCR_VERSION_MAJOR
-#define LGCR_VERSION_MAJOR 1
+#define LGCR_VERSION_MAJOR 2
 #endif
 #ifndef LGCR_VERSION_MINOR
-#define LGCR_VERSION_MINOR 0
+#define LGCR_VERSION_MINOR 1
 #endif
 
 using namespace lgcr;

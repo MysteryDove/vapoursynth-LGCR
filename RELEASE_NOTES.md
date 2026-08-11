@@ -1,86 +1,47 @@
-This is the initial public release of LGCR, a VapourSynth 4 plugin for
-luma-guided chroma reconstruction. LGCR is designed to reconstruct subsampled
-chroma while using full-resolution luma structure as a guide.
+# LGCR v2.1.0
+
+LGCR v2.1.0 improves CPU reconstruction memory use and throughput while
+preserving the plugin API, parameters, output formats, and quality semantics.
 
 ## Highlights
 
-- `lgcr.Recon` supports same-size chroma reconstruction and combined resize
-  and reconstruction for planar YUV 4:2:0, 4:2:2, and 4:4:4 clips.
-- Three reconstruction modes are available: guided reconstruction (`algo=2`),
-  per-pixel candidate selection (`algo=4`), and constrained luma-detail
-  transfer (`algo=6`).
-- Chroma siting is read from `_ChromaLocation` when available and can be
-  overridden with `loc="left"` or `loc="center"`.
-- `lgcr.TRecon` adds motion-compensated temporal reconstruction for
-  constant-size clips with a known frame count.
-- `lgcr.Downsample` adds a standalone direction-aware YUV444 to YUV420 path
-  with fast, balanced, and high quality modes; Spline36, Lanczos3, and fixed
-  binomial baselines; six H.273 chroma locations; and a continuous guided
-  strength control. It directly shares the bit-exact Y plane with the output.
-- `Recon` and `TRecon` expose an optional `bm=True` collaborative block-refinement
-  stage. It is disabled by default and implemented independently from the
-  GPL-2.0 VapourSynth-BM3DCUDA project that informed its performance design.
-  AVX2 builds batch the four-patch U/V Haar transforms across SIMD lanes while
-  retaining the scalar implementation as a portability reference.
-- `lgcr.Sharpen` provides edge-aware sharpening while preserving the input
-  dimensions, subsampling, sample type, and bit depth.
-- 8-16-bit integer and 32-bit float planar YUV formats are supported.
-- Pre-built AVX2/FMA binaries are provided for Linux x86-64 and Windows
-  x86-64. A scalar reference build is available from source.
+- Same-size Recon now shares the source luma plane with the output frame.
+- Float Recon uses borrowed input/output views and avoids full-resolution
+  conversion copies on the main path.
+- Frame workspaces use bounded size-class scratch reuse.
+- Algo6 streams same-size detail reconstruction through bounded row rings.
+- Mutual-gate Sobel gradients use a four-pixel-halo row ring instead of six
+  full-resolution gradient planes.
+- Integer output remains bit-exact and float output remains within the existing
+  numerical tolerance.
 
-## Quick Start
+## 1080p Benchmark
 
-Load the downloaded plugin and run the default spatial reconstruction:
+Measured on an AMD Ryzen 9 5950X with a 1920x1080 YUV 4:2:0 Lanczos3 source,
+`sparse=1`, production profiling disabled, one 1-second warm-up and a 5-second
+throughput window. CPU affinity was pinned to `0`, `0-7`, and `0-15`.
 
-```python
-import vapoursynth as vs
+| Algorithm | 1 thread | 8 threads | 16 threads |
+|---|---:|---:|---:|
+| Algo2 | 25.20 FPS | 172.20 FPS | 260.60 FPS |
+| Algo4 | 18.20 FPS | 127.00 FPS | 198.60 FPS |
+| Algo6 | 20.20 FPS | 136.00 FPS | 184.00 FPS |
 
-core = vs.core
-core.std.LoadPlugin("/absolute/path/to/liblgcr.so")  # Use lgcr.dll on Windows.
+These figures are host reference measurements; actual throughput depends on
+source content, VapourSynth scheduling, CPU frequency, and compiler settings.
 
-src = core.ffms2.Source("input.mkv")
-out = core.lgcr.Recon(src)
-out.set_output()
-```
+## Validation
 
-`Recon` and `TRecon` output YUV 4:4:4. Convert the result back to 4:2:0 only
-when required by the delivery format. See the README for the complete API and
-the parameter tuning guide.
+- `make check`
+- `make asan-check`
+- 592-case numerical comparison: float maximum error `2.98e-08`, integers
+  bit-exact
+- AVX2/scalar, backend matrix, concurrency, battery, and evaluation consistency
+  checks
 
-## Release Assets
+## Assets
 
-- `lgcr-<version>-linux-x86_64.tar.gz`: `liblgcr.so`, README, and MIT license.
-- `lgcr-<version>-windows-x86_64.zip`: `lgcr.dll`, README, and MIT license.
+- `lgcr-v2.1.0-linux-x86_64.tar.gz`
+- `lgcr-v2.1.0-windows-x86_64.zip`
 
-The packaged binaries require an x86-64 CPU with AVX2 and FMA support and a
-VapourSynth installation using API v4.
-
-## Performance Note
-
-On the current AMD Ryzen 9 5950X development host, the default spatial path
-(1920x1080 YUV 4:2:0, Lanczos3, `algo=2`, `sparse=1`) measured approximately
-**11.0 FPS with one VapourSynth thread**. This is the median of 30 frames
-(90.81 ms/frame) with production profiling disabled. Performance depends on
-the source, settings, CPU, compiler, and host load; treat this as a reference,
-not a guarantee.
-
-## Known Limitations
-
-- The VapourSynth filters currently select the CPU backend. CUDA buffer,
-  stream, dispatch, timing, and fallback infrastructure is included, but the
-  compute kernels are still being connected.
-- The optional `bm=True` stage is currently CPU-only and uses additional
-  full-resolution float buffers.
-- Inputs must be constant-size planar YUV. `Recon` supports 4:2:0, 4:2:2, and
-  4:4:4; `TRecon` additionally requires a known frame count.
-- `Downsample` requires even-dimension YUV 4:4:4 input. Its high mode is a
-  Wang-inspired local loopback approximation, not a paper-algorithm
-  reproduction, and 4K high-mode performance is reported without a hard gate.
-- Chroma reconstruction is content- and degradation-dependent. Test the
-  defaults on representative material and compare with `strength=0` before
-  tuning. This release does not claim a universal improvement over every
-  conventional resampler or external method.
-
-Linux release builds run the full correctness, regression, backend-matrix,
-evaluation-protocol, and paper-consistency checks before publication. The
-project is available under the MIT License.
+Both archives contain the plugin binary, README, and MIT license.

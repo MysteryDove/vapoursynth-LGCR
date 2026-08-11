@@ -15,6 +15,6 @@ paths=()
 for source in "${sources[@]}"; do
     paths+=("$tmp/src/$source")
 done
-"$cxx" -DLGCR_VERSION_MAJOR=1 -DLGCR_VERSION_MINOR=0 \
+"$cxx" -DLGCR_VERSION_MAJOR=2 -DLGCR_VERSION_MINOR=1 \
     -DLGCR_ENABLE_CUDA=0 -DLGCR_SUFFIX='"_baseline"' $cxxflags \
     -I"$vsinclude" -shared -o "$output" "${paths[@]}"

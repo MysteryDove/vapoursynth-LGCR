@@ -93,7 +93,7 @@ jobs:
           cl /nologo /O2 /std:c++17 /arch:AVX2 /EHsc /D_USE_MATH_DEFINES /DLGCR_ENABLE_CUDA=0 `
             /DLGCR_VERSION_MAJOR=$($version[0]) /DLGCR_VERSION_MINOR=$($version[1]) `
             /I"$env:RUNNER_TEMP\vs\include" /LD `
-            src\pipeline.cpp src\cuda_backend.cpp src\maps.cpp src\kernels.cpp src\recon.cpp src\algos.cpp src\bm.cpp src\downsample.cpp src\plugin.cpp `
+            src\pipeline.cpp src\cuda_backend.cpp src\workspace.cpp src\maps.cpp src\kernels.cpp src\recon.cpp src\algos.cpp src\bm.cpp src\downsample.cpp src\plugin.cpp `
             /Fe:lgcr.dll
           $archive = "lgcr-${{ needs.prepare.outputs.tag }}-windows-x86_64.zip"
           Compress-Archive -Path lgcr.dll,README.md,LICENSE -DestinationPath $archive
