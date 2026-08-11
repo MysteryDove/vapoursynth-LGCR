@@ -33,6 +33,11 @@ STAGES = (
     "buildAffineMaps",
     "buildDetail",
     "detailTransfer",
+    "collaborative_chroma",
+    "downsample_base",
+    "downsample_guide",
+    "downsample_candidate_score",
+    "downsample_output",
     "backProject",
     "output_conversion",
 )
@@ -70,14 +75,18 @@ class Case:
     algo: str
     sparse: bool
     options: tuple = ()
+    operation: str = "Recon"
 
     @property
     def key(self):
         suffix = ",".join(f"{key}={value}" for key, value in self.options)
-        return (f"{self.width}x{self.height}/{self.subsampling}/{self.kernel}/"
+        operation = "" if self.operation == "Recon" else f"{self.operation}/"
+        return (f"{self.width}x{self.height}/{self.subsampling}/{operation}{self.kernel}/"
                 f"{self.algo}/sparse={int(self.sparse)}/{suffix}")
 
     def kwargs(self):
+        if self.operation == "Downsample":
+            return dict(self.options)
         result = dict(next(values for name, values in KERNELS if name == self.kernel))
         result.setdefault("kernel", self.kernel)
         result["strength"] = 0.0 if self.algo == "plain" else 0.8
@@ -163,6 +172,10 @@ def matrix_for(args):
             cases.append(Case(width, height, 1, 1, "420", kernel, "plain", False))
         for algo in ("2", "4", "6"):
             cases.append(Case(width, height, 1, 1, "420", "lanczos3", algo, True))
+        for quality in (0, 1, 2):
+            cases.append(Case(
+                width, height, 0, 0, "444", "spline36", f"q{quality}", False,
+                (("quality", quality), ("kernel", "spline36")), "Downsample"))
         return cases
 
     cases = []
@@ -178,13 +191,19 @@ def matrix_for(args):
         for name, values in (
                 ("ms", (0.0, 1.0)),
                 ("ridge", (0, 1)),
-                ("cedge", (0, 1))):
+                ("cedge", (0, 1)),
+                ("bm", (0, 1))):
             for value in values:
                 cases.append(Case(width, height, 1, 1, "420", "lanczos3", "2", True,
                                   ((name, value),)))
         for value in (0.0, 1.0):
             cases.append(Case(width, height, 1, 1, "420", "lanczos3", "6", True,
                               (("qgate", value),)))
+        for kernel in ("spline36", "lanczos3", "binomial"):
+            for quality in (0, 1, 2):
+                cases.append(Case(
+                    width, height, 0, 0, "444", kernel, f"q{quality}", False,
+                    (("quality", quality), ("kernel", kernel)), "Downsample"))
     return cases
 
 
@@ -317,8 +336,9 @@ def main():
         for case in cases:
             source = make_source(core, case, args.iterations + 2)
             kwargs = case.kwargs()
-            node = core.lgcr.Recon(source, **kwargs)
-            scalar = core.lgcr_scalar.Recon(source, **kwargs) if scalar_enabled else None
+            node = getattr(core.lgcr, case.operation)(source, **kwargs)
+            scalar = (getattr(core.lgcr_scalar, case.operation)(source, **kwargs)
+                      if scalar_enabled else None)
 
             # Warm geometry, LUTs, code paths, and the frame allocator twice.
             node.get_frame(0)
@@ -335,6 +355,12 @@ def main():
             scalar_errors = []
             checksums = []
             for frame_number in range(2, args.iterations + 2):
+                # Downsample has explicit per-filter millisecond gates. Keep its
+                # distinct input frame resident so the measurement excludes
+                # this benchmark's NumPy ModifyFrame source construction.
+                source_precached = case.operation == "Downsample"
+                if source_precached:
+                    source.get_frame(frame_number)
                 rss_before = memory_kib("VmRSS")
                 start = time.perf_counter_ns()
                 frame = node.get_frame(frame_number)
@@ -361,6 +387,8 @@ def main():
                     "case": case.key,
                     "frame": frame_number,
                     "config": kwargs,
+                    "operation": case.operation,
+                    "source_precached": source_precached,
                     "width": case.width,
                     "height": case.height,
                     "subsampling": case.subsampling,
@@ -389,6 +417,8 @@ def main():
             summary = {
                 "record_type": "summary",
                 "case": case.key,
+                "operation": case.operation,
+                "source_precached": case.operation == "Downsample",
                 "frames": args.iterations,
                 "median_ms": float(np.median(wall_samples)),
                 "min_ms": min(wall_samples),

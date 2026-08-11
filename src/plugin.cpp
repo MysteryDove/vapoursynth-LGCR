@@ -487,6 +487,11 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
             reconstructChroma(job);
         }
     }
+    if (d->bm) {
+        ScopedStageTimer timer(metrics, Stage::ApplyCollaborativeFilter);
+        collaborativeChromaFilter(y, cOutU, cOutV, float(d->sigma), metrics);
+    }
+
     // Back-projection data consistency: re-downsample the reconstruction and
     // return a fraction of the residual, D_h(C + delta) ~= C_src.
     if (d->bp > 0.0 && d->outW == sw && d->outH == sh && cw * 2 == sw && ch * 2 == sh) {
@@ -703,6 +708,9 @@ static const VSFrame *VS_CC tReconGetFrame(int n, int activationReason, void *in
         reconstructChroma(job);
     }
 
+    if (d->bm)
+        collaborativeChromaFilter(y, cOutU, cOutV, float(d->sigma));
+
     for (int p = 0; p < 2; ++p) {
         const Plane &cOut = (p == 0) ? cOutU : cOutV;
         const double outScale = isFloat ? 1.0 : double((1 << fmt->bitsPerSample) - 1);
@@ -765,6 +773,8 @@ static void VS_CC tReconCreate(const VSMap *in, VSMap *out, void *, VSCore *core
     {
         const int64_t ri = vsapi->mapGetIntSaturated(in, "ridge", 0, &err);
         d->ridge = err ? true : (ri != 0);
+        const int64_t bm = vsapi->mapGetIntSaturated(in, "bm", 0, &err);
+        d->bm = err ? false : (bm != 0);
     }
     // lanczos3 base kernel; sparse off by default (static-region temporal
     // averaging is part of the value)
@@ -926,6 +936,8 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
     {
         const int64_t sp = vsapi->mapGetIntSaturated(in, "sparse", 0, &err);
         d->sparse = err ? true : (sp != 0);
+        const int64_t bm = vsapi->mapGetIntSaturated(in, "bm", 0, &err);
+        d->bm = err ? false : (bm != 0);
     }
     d->bp = vsapi->mapGetFloatSaturated(in, "bp", 0, &err); if (err) d->bp = 0.0;
     if (fmt->subSamplingW == 0)
@@ -968,7 +980,7 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
         "Recon",
         "clip:vnode;width:int:opt;height:int:opt;kernel:data:opt;taps:int:opt;algo:int:opt;"
         "b:float:opt;c:float:opt;strength:float:opt;sigma:float:opt;sratio:float:opt;"
-        "sdb:float:opt;stretch:float:opt;gsigma:float:opt;rescue:float:opt;ridge:int:opt;cedge:int:opt;ar:float:opt;reg:float:opt;loc:data:opt;sparse:int:opt;bp:float:opt;ms:float:opt;qgate:float:opt",
+        "sdb:float:opt;stretch:float:opt;gsigma:float:opt;rescue:float:opt;ridge:int:opt;cedge:int:opt;ar:float:opt;reg:float:opt;loc:data:opt;sparse:int:opt;bp:float:opt;ms:float:opt;qgate:float:opt;bm:int:opt",
         "clip:vnode", lgcrCreate, nullptr, plugin);
     vspapi->registerFunction(
         "Sharpen",
@@ -979,6 +991,7 @@ VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
         "TRecon",
         "clip:vnode;strength:float:opt;sigma:float:opt;sratio:float:opt;sdb:float:opt;"
         "gsigma:float:opt;stretch:float:opt;ar:float:opt;ridge:int:opt;sparse:int:opt;ms:float:opt;"
-        "trad:int:opt;tsearch:int:opt;tsad:float:opt",
+        "trad:int:opt;tsearch:int:opt;tsad:float:opt;bm:int:opt",
         "clip:vnode", tReconCreate, nullptr, plugin);
+    registerDownsample(plugin, vspapi);
 }

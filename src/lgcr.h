@@ -41,6 +41,8 @@ std::shared_ptr<GeometryCache> makeGeometryCache();
 
 enum class Kernel { Bilinear, Bicubic, Lanczos, Spline16, Spline36, Jinc };
 
+enum class DownsampleKernel { Spline36, Lanczos3, Binomial };
+
 // Jinc is radially symmetric and evaluated through a 1D profile LUT.
 inline bool kernelIsRadial(Kernel k) { return k == Kernel::Jinc; }
 
@@ -144,6 +146,7 @@ struct LGCRData {
     bool sparse = true;              // sparse correction: guide only near luma structure
     bool locSet = false;             // loc param explicitly given (else read _ChromaLocation)
     double bp = 0.0;                 // back-projection data-consistency gain (420 same-size)
+    bool bm = false;                 // optional BM3D-style collaborative chroma refinement
     int trad = 1;                    // TRecon: temporal radius (frames each side)
     int tsearch = 6;                 // TRecon: ME search range (luma px, integer)
     double tsad = 0.02;              // TRecon: ME SAD-per-pixel confidence scale
@@ -341,11 +344,32 @@ struct WeightTable {
     std::vector<float> w;   // n * sup weights, normalized
 };
 
+// Standalone 4:4:4 -> 4:2:0 filter. It deliberately does not share the Recon
+// frame pipeline: source samples are read in place and only short row rings are
+// allocated for the separable base and high-quality candidates.
+struct DownsampleData {
+    VSNode *node = nullptr;
+    const VSVideoInfo *viIn = nullptr;
+    VSVideoInfo viOut{};
+    int quality = 0;
+    DownsampleKernel kernel = DownsampleKernel::Spline36;
+    float strength = 1.0f;
+    float shiftX = -0.5f;
+    float shiftY = 0.0f;
+    int chromaLocation = 0;
+    WeightTable xWeights;
+    WeightTable yWeights;
+};
+
 WeightTable buildWeights(int srcN, int dstN, Kernel k, double kp1, double kp2,
                          double support, double shift /* source units */);
 
 void resampleH(const Plane &src, Plane &dst, const WeightTable &t);
 void resampleV(const Plane &src, Plane &dst, const WeightTable &t);
+
+// Registers the standalone Downsample filter. Its implementation lives in
+// downsample.cpp so no Recon/algo dispatch is reachable from this API.
+void registerDownsample(VSPlugin *plugin, const VSPLUGINAPI *vspapi);
 
 // Radial (jinc) profile LUT lookups
 inline float lutLookup(const float *lut, int n, float idx) {
@@ -570,6 +594,13 @@ void applyChromaConsistency(const Plane &curU, const Plane &curV,
                             const std::vector<int16_t> &mvx,
                             const std::vector<int16_t> &mvy,
                             int bw, int bh, std::vector<float> &conf);
+
+// Optional BM3D-inspired basic stage. Similar 8x8 patches are grouped using
+// luma and reconstructed chroma, collaboratively hard-thresholded with a
+// separable 3D Haar transform, then overlap-aggregated. This is an independent
+// implementation; no third-party BM3D source code is included.
+void collaborativeChromaFilter(const Plane &guide, Plane &u, Plane &v,
+                               float guideSigma, PipelineMetrics *metrics = nullptr);
 
 // ---------------------------------------------------------------------------
 // Sharpen: gated Laplacian (bilateral USM)

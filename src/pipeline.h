@@ -108,6 +108,11 @@ enum class Stage : uint8_t {
     ApplyGuidedCorrection,
     ApplySelector,
     ApplyDetailTransfer,
+    ApplyCollaborativeFilter,
+    DownsampleBase,
+    DownsampleGuide,
+    DownsampleCandidateScore,
+    DownsampleOutput,
     BackProject,
     ConvertOutput,
 };
@@ -180,6 +185,26 @@ inline constexpr std::array<StageContract, stageCount> stageContracts = {{
       ScalarType::Float32, bufferBit(BufferId::BaseU) | bufferBit(BufferId::BaseV) |
           bufferBit(BufferId::AffineMaps) | bufferBit(BufferId::Detail),
       bufferBit(BufferId::OutputU) | bufferBit(BufferId::OutputV), true, true },
+    { Stage::ApplyCollaborativeFilter, StageSupport::CPU, BoundaryMode::Clamp,
+      ScalarType::Float32, bufferBit(BufferId::SourceY) |
+          bufferBit(BufferId::OutputU) | bufferBit(BufferId::OutputV),
+      bufferBit(BufferId::OutputU) | bufferBit(BufferId::OutputV), true, true },
+    { Stage::DownsampleBase, StageSupport::CPU, BoundaryMode::Clamp,
+      ScalarType::Float32, bufferBit(BufferId::SourceU) | bufferBit(BufferId::SourceV),
+      bufferBit(BufferId::BaseU) | bufferBit(BufferId::BaseV), true, false },
+    { Stage::DownsampleGuide, StageSupport::CPU, BoundaryMode::Clamp,
+      ScalarType::Float32, bufferBit(BufferId::SourceY) |
+          bufferBit(BufferId::SourceU) | bufferBit(BufferId::SourceV),
+      bufferBit(BufferId::GuidedU) | bufferBit(BufferId::GuidedV), true, false },
+    { Stage::DownsampleCandidateScore, StageSupport::CPU, BoundaryMode::Clamp,
+      ScalarType::Float32, bufferBit(BufferId::SourceY) |
+          bufferBit(BufferId::SourceU) | bufferBit(BufferId::SourceV) |
+          bufferBit(BufferId::GuidedU) | bufferBit(BufferId::GuidedV),
+      bufferBit(BufferId::OutputU) | bufferBit(BufferId::OutputV), true, false },
+    { Stage::DownsampleOutput, StageSupport::CPU, BoundaryMode::Clamp,
+      ScalarType::Float32, bufferBit(BufferId::BaseU) | bufferBit(BufferId::BaseV) |
+          bufferBit(BufferId::GuidedU) | bufferBit(BufferId::GuidedV),
+      bufferBit(BufferId::OutputFrame), true, false },
     { Stage::BackProject, StageSupport::CPU, BoundaryMode::Clamp,
       ScalarType::Float32, bufferBit(BufferId::SourceU) | bufferBit(BufferId::SourceV) |
           bufferBit(BufferId::OutputU) | bufferBit(BufferId::OutputV),
@@ -208,6 +233,11 @@ constexpr std::string_view stageName(Stage stage) {
     case Stage::ApplyGuidedCorrection: return "reconstructChroma";
     case Stage::ApplySelector:         return "selectorBlend";
     case Stage::ApplyDetailTransfer:   return "detailTransfer";
+    case Stage::ApplyCollaborativeFilter: return "collaborative_chroma";
+    case Stage::DownsampleBase:        return "downsample_base";
+    case Stage::DownsampleGuide:       return "downsample_guide";
+    case Stage::DownsampleCandidateScore: return "downsample_candidate_score";
+    case Stage::DownsampleOutput:      return "downsample_output";
     case Stage::BackProject:           return "backProject";
     case Stage::ConvertOutput:         return "output_conversion";
     }

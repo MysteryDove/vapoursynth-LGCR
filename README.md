@@ -1,9 +1,9 @@
 # LGCR
 
 LGCR is a VapourSynth 4 plugin for luma-guided chroma reconstruction. It
-provides same-size chroma upsampling, combined resize and reconstruction,
-optional temporal reconstruction, and edge-aware sharpening for planar YUV
-clips.
+provides same-size chroma upsampling, guided 4:4:4 to 4:2:0 downsampling,
+combined resize and reconstruction, optional temporal reconstruction, and
+edge-aware sharpening for planar YUV clips.
 
 This repository is the source distribution. Release assets are pre-built for
 Linux x86-64 and Windows x86-64; choose the asset matching the host CPU and
@@ -106,8 +106,8 @@ core.std.LoadPlugin("/absolute/path/to/liblgcr.so")
 ```
 
 Alternatively, install `liblgcr.so` in a VapourSynth autoload directory. The
-functions are then available as `core.lgcr.Recon`, `core.lgcr.TRecon`, and
-`core.lgcr.Sharpen`.
+functions are then available as `core.lgcr.Recon`, `core.lgcr.Downsample`,
+`core.lgcr.TRecon`, and `core.lgcr.Sharpen`.
 
 ## Function Reference
 
@@ -139,6 +139,7 @@ lgcr.Recon(
     bp=0.0,
     ms=1.0,
     qgate=1.0,
+    bm=False,
 )
 ```
 
@@ -186,6 +187,54 @@ plain = core.lgcr.Recon(src, strength=0.0)
 - `algo=6` applies constrained luma-detail transfer to the base reconstruction.
 - `strength=0.0` disables guidance and is useful for A/B comparisons.
 
+#### Optional Collaborative Block Refinement
+
+```python
+block_refined = core.lgcr.Recon(src, bm=True)
+```
+
+`bm=True` enables an experimental BM3D-inspired basic stage after chroma
+reconstruction. It groups similar 8x8 patches on an 8-pixel anchor grid using
+luma and the reconstructed U/V planes, applies separable 3D Haar hard
+thresholding, and aggregates the filtered patches. The stage runs before
+same-size 4:2:0 back-projection, so `bp` can still enforce source-sample
+consistency.
+
+For noisy sources, prefer a dedicated spatial or temporal denoiser before
+LGCR when one is already available in the processing chain. This cleans both
+the luma guide and the source chroma; leave `bm=False` unless visible chroma
+noise remains. When upstream denoising is unavailable, `bm=True` provides a
+self-contained alternative for residual chroma noise:
+
+```python
+# Preferred when a dedicated denoiser is already part of the script.
+denoised = your_denoiser(src)
+reconstructed = core.lgcr.Recon(denoised)  # bm=False by default
+
+# Self-contained alternative when no upstream denoiser is available.
+reconstructed_with_bm = core.lgcr.Recon(src, bm=True)
+```
+
+The built-in BM stage filters only the reconstructed U/V planes. It does not
+denoise luma, repair compression artifacts before luma guidance, or replace a
+dedicated temporal denoiser. Avoid stacking it automatically after strong
+upstream denoising: the remaining gain may be small, while unmatched soft
+chroma detail can be softened. The paired synthetic study found the clearest
+benefit on noisy input; see the BM refinement results linked below.
+
+The implementation is independent and includes no source code from
+[VapourSynth-BM3DCUDA](https://github.com/WolframRhodium/VapourSynth-BM3DCUDA),
+which is GPL-2.0. Its high-performance block-search and aggregation design, and
+the [original BM3D method of Dabov et al.](https://doi.org/10.1109/TIP.2007.901238),
+informed this optional path. The stage is currently CPU-only, uses additional
+full-resolution float buffers, and is not part of the frozen paper evaluation.
+AVX2 builds transform each four-patch U/V group across SIMD lanes; scalar builds
+use the same algorithm as a portability and correctness reference. On the
+current Ryzen 9 5950X development host, the 1920x1080 single-thread reference
+case measured approximately 255 ms/frame with `bm=True` versus 86 ms/frame
+with `bm=False`. Performance depends on the source and host; treat these as
+relative reference figures rather than a guarantee.
+
 #### Chroma Siting
 
 When `loc` is omitted, `Recon` reads the frame's `_ChromaLocation` property.
@@ -230,6 +279,72 @@ leave `loc` unset.
 | `reg` | `0.005` | Positive regularization for algos 4 and 6 |
 | `cedge` | `0` | Experimental chroma-transition gate toggle |
 | `bp` | `0.0` | Same-size 4:2:0 back-projection gain, `0..1` |
+| `bm` | `False` | Enable experimental BM3D-style collaborative chroma refinement |
+
+### `lgcr.Downsample`
+
+```python
+lgcr.Downsample(
+    clip,
+    quality=0,
+    kernel="spline36",
+    strength=1.0,
+    loc="left",
+)
+```
+
+`Downsample` accepts only constant-size, even-dimension planar YUV 4:4:4 in
+8-16-bit integer or 32-bit float format. It preserves the frame width, height,
+sample type, and bit depth while returning YUV 4:2:0. The Y plane is attached
+to the output frame through VapourSynth's plane-sharing API and is bit-exact;
+only U and V are computed.
+
+This is a standalone 4:4:4 to 4:2:0 path. It does not call `Recon`, does not use
+`algo=6`, and does not allocate a full-frame float guide or tensor map. The
+plain separable result is generated through a short row ring. Guided weights
+are then evaluated directly on the output grid from local Y/U/V samples, with
+shared direction classification for both chroma planes. Flat luma, isolated
+chroma transitions, direction mismatches, and low-confidence structure fall
+back to the plain result.
+
+| `quality` | Local support | Direction/candidate tradeoff |
+|---:|---:|---|
+| `0` | up to 5x5 | Fast; isotropic, horizontal, vertical, and two diagonal classes with a hard direction choice |
+| `1` | up to 7x7 | Balanced; eight directions plus isotropic, softly blending the nearest two directions |
+| `2` | up to 9x9 | High; keeps short rings of directional/anisotropic candidates and selects them with a luma-edge-weighted fixed bilinear 2x loopback score |
+
+Quality 2 is a local approximation inspired by the Wang-style loopback idea,
+not a reproduction of a published algorithm. It stores only the candidate rows
+needed by the current score window and creates no internal thread pool.
+
+`strength=0` selects the same plain baseline in every quality mode. Values up
+to `1` continuously blend towards the gated guided result. The correction is a
+convex move from the baseline towards a positive-weight local chroma estimate,
+so it cannot increase the baseline's local-hull overshoot.
+
+The output location is explicit and is written to `_ChromaLocation` using the
+corresponding H.273 value:
+
+```python
+left = core.lgcr.Downsample(src444, loc="left")
+center = core.lgcr.Downsample(src444, loc="center")
+top_left = core.lgcr.Downsample(src444, loc="topleft")
+top = core.lgcr.Downsample(src444, loc="top")
+bottom_left = core.lgcr.Downsample(src444, loc="bottomleft")
+bottom = core.lgcr.Downsample(src444, loc="bottom")
+```
+
+| Parameter | Default | Accepted values / purpose |
+|---|---:|---|
+| `quality` | `0` | `0` fast, `1` balanced, or `2` high |
+| `kernel` | `"spline36"` | `"spline36"`, `"lanczos3"`, or `"binomial"` plain baseline |
+| `strength` | `1.0` | Guided blend, `0..1`; `0` is the plain baseline |
+| `loc` | `"left"` | `"left"`, `"center"`, `"topleft"`, `"top"`, `"bottomleft"`, or `"bottom"` |
+
+Spline36 and Lanczos3 use the shared polyphase weight generator. `binomial`
+uses fixed normalized phases: a five-tap `[1, 4, 6, 4, 1] / 16` filter at
+integer sample positions and a four-tap `[1, 3, 3, 1] / 8` filter at
+half-integer positions.
 
 ### `lgcr.Sharpen`
 
@@ -286,6 +401,7 @@ lgcr.TRecon(
     trad=1,
     tsearch=6,
     tsad=0.02,
+    bm=False,
 )
 ```
 
@@ -296,6 +412,7 @@ to algo 2 with Lanczos3.
 ```python
 temporal = core.lgcr.TRecon(src, trad=1)
 temporal_wide = core.lgcr.TRecon(src, trad=2, tsearch=8)
+temporal_block_refined = core.lgcr.TRecon(src, trad=1, bm=True)
 ```
 
 Use `Recon` for still images, single-frame clips, or when temporal motion
@@ -318,6 +435,7 @@ matching is not desired.
 | `ridge` | `1` | Thin-line protection toggle |
 | `sparse` | `0` | Sparse guided-work toggle |
 | `ms` | `1.0` | Mutual-structure gate strength, `0..1` |
+| `bm` | `False` | Enable post-reconstruction BM3D-style collaborative chroma refinement |
 
 ## Parameter Tuning Guide
 
@@ -344,6 +462,8 @@ ringing, softness, and false colour.
 | 4:2:0 average is not preserved after same-size reconstruction | Raise `bp` from `0` towards `1` | Adds data-consistency back-projection; too high can flatten edges |
 | Chroma edges are shifted left/right | Set `loc="left"` or `loc="center"`, or fix `_ChromaLocation` | Correct siting before tuning quality parameters; `loc` only controls horizontal siting |
 | Resizing changes the character of the result | Try `kernel` and `taps` | `bilinear` is soft, `bicubic` is tunable with `b/c`, higher Lanczos/Jinc taps are sharper and slower |
+| The source contains luma and chroma noise | Denoise before `Recon`; keep `bm=False` initially | Gives LGCR a cleaner guide and lets a dedicated denoiser handle both luma and chroma |
+| Repeated flat or textured regions retain chroma noise after reconstruction | Try `bm=True` | Adds self-contained non-local chroma filtering; costs substantial CPU time and memory, and may soften unmatched detail |
 
 `b` and `c` only affect `kernel="bicubic"`: increase `b` for a smoother,
 less ringing response; increase `c` for a sharper response. Keep both near
@@ -352,6 +472,10 @@ luma/chroma structure disagrees; lower it when textured chroma is being
 suppressed, and raise it when false structure is appearing. `sigma` is the
 absolute similarity floor, while `sratio` scales with the local luma range.
 Higher values accept larger luma differences; lower values reject them.
+With `bm=True`, `sigma` also seeds the block-match acceptance and transform
+threshold; there is intentionally no second BM-specific strength control yet.
+If an upstream denoiser already removed the visible chroma noise, compare
+against `bm=False` before retaining the additional BM pass.
 
 ### Sharpen
 
@@ -372,20 +496,28 @@ Higher values accept larger luma differences; lower values reject them.
 | Motion matches are unstable or ghost | Lower `tsad`; lower `trad` | Rejects weaker matches / uses fewer frames |
 | Temporal result is too guided or too soft | Adjust `strength`, `sigma`, `sratio`, `sdb`, `gsigma`, `stretch`, `ridge`, `ar`, and `ms` as in `Recon` | TRecon uses the fixed algo-2 Lanczos3 spatial base |
 | Flat areas need temporal averaging | Keep `sparse=0` | `sparse=1` saves guided work but skips corrections away from luma structure |
+| Motion compensation is stable but residual chroma noise remains | Try `bm=True` | Applies collaborative spatial refinement after temporal reconstruction; it does not replace motion matching |
 | A single-frame or variable-length clip is used | Use `Recon` instead | TRecon requires constant dimensions and a known frame count |
 
 For a first pass, use `Recon(src)` for stills and `TRecon(src, trad=1)` for
 stable video. Tune siting and the base kernel before changing algorithmic
-gates. Always inspect animation line art and natural-texture shots separately.
+gates. For noisy video, run an existing temporal denoiser before `TRecon` when
+possible; use `bm=True` as the built-in residual-chroma alternative. Always
+inspect animation line art and natural-texture shots separately.
 
 ## Output And Encoding
 
-`Recon` and `TRecon` return 4:4:4. Convert back to 4:2:0 only when required by
-the delivery format:
+`Recon` and `TRecon` return 4:4:4. Downsample only when required by the delivery
+format:
 
 ```python
 reconstructed = core.lgcr.Recon(src)
-delivery = core.resize.Spline36(reconstructed, format=vs.YUV420P10)
+delivery = core.lgcr.Downsample(
+    reconstructed,
+    quality=1,
+    kernel="spline36",
+    loc="left",
+)
 delivery.set_output()
 ```
 
@@ -401,6 +533,8 @@ vspipe --y4m script.vpy - | ffmpeg -i - -c:v libx265 -crf 16 output.mkv
 - [Publication plan and evidence ledger](paper/PLAN.md)
 - [Evaluation protocol](evaluation/protocol.md)
 - [Generated results](evaluation/results/test.md)
+- [BM refinement study protocol](evaluation/bm_study_protocol.md)
+- [BM refinement study results](evaluation/results/bm_study.md)
 
 Regenerate the synthetic evaluation with the VapourSynth-enabled Python
 interpreter:

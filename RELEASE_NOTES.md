@@ -13,6 +13,15 @@ chroma while using full-resolution luma structure as a guide.
   overridden with `loc="left"` or `loc="center"`.
 - `lgcr.TRecon` adds motion-compensated temporal reconstruction for
   constant-size clips with a known frame count.
+- `lgcr.Downsample` adds a standalone direction-aware YUV444 to YUV420 path
+  with fast, balanced, and high quality modes; Spline36, Lanczos3, and fixed
+  binomial baselines; six H.273 chroma locations; and a continuous guided
+  strength control. It directly shares the bit-exact Y plane with the output.
+- `Recon` and `TRecon` expose an optional `bm=True` collaborative block-refinement
+  stage. It is disabled by default and implemented independently from the
+  GPL-2.0 VapourSynth-BM3DCUDA project that informed its performance design.
+  AVX2 builds batch the four-patch U/V Haar transforms across SIMD lanes while
+  retaining the scalar implementation as a portability reference.
 - `lgcr.Sharpen` provides edge-aware sharpening while preserving the input
   dimensions, subsampling, sample type, and bit depth.
 - 8-16-bit integer and 32-bit float planar YUV formats are supported.
@@ -60,8 +69,13 @@ not a guarantee.
 - The VapourSynth filters currently select the CPU backend. CUDA buffer,
   stream, dispatch, timing, and fallback infrastructure is included, but the
   compute kernels are still being connected.
+- The optional `bm=True` stage is currently CPU-only and uses additional
+  full-resolution float buffers.
 - Inputs must be constant-size planar YUV. `Recon` supports 4:2:0, 4:2:2, and
   4:4:4; `TRecon` additionally requires a known frame count.
+- `Downsample` requires even-dimension YUV 4:4:4 input. Its high mode is a
+  Wang-inspired local loopback approximation, not a paper-algorithm
+  reproduction, and 4K high-mode performance is reported without a hard gate.
 - Chroma reconstruction is content- and degradation-dependent. Test the
   defaults on representative material and compare with `strength=0` before
   tuning. This release does not claim a universal improvement over every

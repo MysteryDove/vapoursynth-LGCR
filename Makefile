@@ -24,7 +24,7 @@ else
 CPPFLAGS += -DLGCR_ENABLE_CUDA=0
 endif
 
-SRCS    := src/pipeline.cpp src/cuda_backend.cpp src/maps.cpp src/kernels.cpp src/recon.cpp src/algos.cpp src/plugin.cpp
+SRCS    := src/pipeline.cpp src/cuda_backend.cpp src/maps.cpp src/kernels.cpp src/recon.cpp src/algos.cpp src/bm.cpp src/downsample.cpp src/plugin.cpp
 OBJS    := $(SRCS:.cpp=.o)
 HDR     := $(wildcard src/*.h)
 
@@ -68,6 +68,8 @@ check: $(TARGET) liblgcr_scalar.so pipeline-check
 	$(PYTHON) test/test_lgcr.py
 	$(PYTHON) test/test_algo6.py
 	$(PYTHON) test/test_regressions.py
+	$(PYTHON) test/test_bm.py
+	$(PYTHON) test/test_downsample.py
 	$(PYTHON) test/test_backend_matrix.py
 	$(PYTHON) test/battery.py --all --check
 	$(PYTHON) -m evaluation.test_protocol
@@ -105,6 +107,9 @@ eval-wada-confirm: $(TARGET)
 eval-corpora:
 	$(PYTHON) -m evaluation.coedge --write-results
 
+eval-bm: $(TARGET)
+	$(PYTHON) -m evaluation.bm_study --write-results
+
 eval-results: eval-dev eval-test eval-ablation eval-siting eval-phase
 
 benchmark: $(TARGET)
@@ -113,11 +118,15 @@ benchmark: $(TARGET)
 asan-check: liblgcr_asan.so
 	ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 \
 	LGCR_PLUGIN="$(CURDIR)/liblgcr_asan.so" $(PYTHON) test/test_regressions.py --asan
+	ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 \
+	LGCR_PLUGIN="$(CURDIR)/liblgcr_asan.so" $(PYTHON) test/test_bm.py
+	ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 \
+	LGCR_PLUGIN="$(CURDIR)/liblgcr_asan.so" $(PYTHON) test/test_downsample.py
 
 clean:
 	rm -f $(TARGET) liblgcr_scalar.so liblgcr_asan.so test/test_pipeline \
 		test/test_pipeline_cuda $(BUILD_CONFIG) src/*.o
 
-.PHONY: all check pipeline-check cuda-framework-check paper-check asan-check benchmark eval-dev eval-test eval-ablation eval-siting eval-phase eval-kernels eval-kernel-confirm eval-kernel-study eval-wada-confirm eval-corpora eval-results clean FORCE
+.PHONY: all check pipeline-check cuda-framework-check paper-check asan-check benchmark eval-dev eval-test eval-ablation eval-siting eval-phase eval-kernels eval-kernel-confirm eval-kernel-study eval-wada-confirm eval-corpora eval-bm eval-results clean FORCE
 
 FORCE:
