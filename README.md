@@ -222,19 +222,6 @@ upstream denoising: the remaining gain may be small, while unmatched soft
 chroma detail can be softened. The paired synthetic study found the clearest
 benefit on noisy input; see the BM refinement results linked below.
 
-The implementation is independent and includes no source code from
-[VapourSynth-BM3DCUDA](https://github.com/WolframRhodium/VapourSynth-BM3DCUDA),
-which is GPL-2.0. Its high-performance block-search and aggregation design, and
-the [original BM3D method of Dabov et al.](https://doi.org/10.1109/TIP.2007.901238),
-informed this optional path. The stage is currently CPU-only, uses additional
-full-resolution float buffers, and is not part of the frozen paper evaluation.
-AVX2 builds transform each four-patch U/V group across SIMD lanes; scalar builds
-use the same algorithm as a portability and correctness reference. On the
-current Ryzen 9 5950X development host, the 1920x1080 single-thread reference
-case measured approximately 255 ms/frame with `bm=True` versus 86 ms/frame
-with `bm=False`. Performance depends on the source and host; treat these as
-relative reference figures rather than a guarantee.
-
 #### Chroma Siting
 
 When `loc` is omitted, `Recon` reads the frame's `_ChromaLocation` property.
