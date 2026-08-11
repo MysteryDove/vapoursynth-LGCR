@@ -51,7 +51,7 @@ jobs:
           /DLGCR_ENABLE_CUDA=0 /DLGCR_VERSION_MAJOR=1 /DLGCR_VERSION_MINOR=0
           /I%RUNNER_TEMP%\vs\include /LD
           src\pipeline.cpp src\cuda_backend.cpp src\maps.cpp src\kernels.cpp
-          src\recon.cpp src\algos.cpp src\plugin.cpp
+          src\recon.cpp src\algos.cpp src\bm.cpp src\downsample.cpp src\plugin.cpp
           /Fe:lgcr.dll
 
       - uses: actions/upload-artifact@v4
