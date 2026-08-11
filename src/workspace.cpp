@@ -1,18 +1,30 @@
 #include "lgcr.h"
 
 #include <limits>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace lgcr {
 
 namespace {
 
 size_t physicalMemoryQuarter() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status))
+        return 0;
+    const uint64_t bytes = static_cast<uint64_t>(status.ullTotalPhys);
+#else
     const long pages = sysconf(_SC_PHYS_PAGES);
     const long pageSize = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || pageSize <= 0)
         return 0;
     const uint64_t bytes = uint64_t(pages) * uint64_t(pageSize);
+#endif
     constexpr uint64_t fourGiB = uint64_t{4} << 30;
     return static_cast<size_t>(std::min<uint64_t>(
         std::min(bytes / 4, fourGiB), std::numeric_limits<size_t>::max()));
