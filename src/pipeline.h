@@ -261,10 +261,23 @@ enum class CpuProfileSlot : uint8_t {
     GuidedMetadata,
     GuidedTapAccumulation,
     GuidedNormalizationSelector,
+    TrustSeed,
+    TrustDilate,
+    MutualGradients,
+    MutualGate,
+    PlainHorizontal,
+    PlainVertical,
+    LGFMoments,
+    LGFFinalize,
+    AffineRolling,
+    AffineConsume,
+    DetailReconstruct,
+    DetailNyquist,
+    DetailTransfer,
 };
 
 constexpr size_t cpuProfileSlotCount =
-    static_cast<size_t>(CpuProfileSlot::GuidedNormalizationSelector) + 1;
+    static_cast<size_t>(CpuProfileSlot::DetailTransfer) + 1;
 
 constexpr std::string_view cpuProfileSlotName(CpuProfileSlot slot) {
     switch (slot) {
@@ -282,6 +295,19 @@ constexpr std::string_view cpuProfileSlotName(CpuProfileSlot slot) {
     case CpuProfileSlot::GuidedMetadata:              return "guided_metadata";
     case CpuProfileSlot::GuidedTapAccumulation:       return "guided_tap_accumulation";
     case CpuProfileSlot::GuidedNormalizationSelector: return "guided_normalization_selector";
+    case CpuProfileSlot::TrustSeed:                   return "trust_seed";
+    case CpuProfileSlot::TrustDilate:                 return "trust_dilate";
+    case CpuProfileSlot::MutualGradients:             return "mutual_gradients";
+    case CpuProfileSlot::MutualGate:                  return "mutual_gate";
+    case CpuProfileSlot::PlainHorizontal:             return "plain_horizontal";
+    case CpuProfileSlot::PlainVertical:               return "plain_vertical";
+    case CpuProfileSlot::LGFMoments:                  return "lgf_moments";
+    case CpuProfileSlot::LGFFinalize:                 return "lgf_finalize";
+    case CpuProfileSlot::AffineRolling:               return "affine_rolling";
+    case CpuProfileSlot::AffineConsume:               return "affine_consume";
+    case CpuProfileSlot::DetailReconstruct:           return "detail_reconstruct";
+    case CpuProfileSlot::DetailNyquist:               return "detail_nyquist";
+    case CpuProfileSlot::DetailTransfer:              return "detail_transfer";
     }
     return "unknown";
 }

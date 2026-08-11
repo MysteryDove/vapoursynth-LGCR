@@ -91,6 +91,8 @@ void reconstructChromaImpl(const ChromaJob &job) {
         bool hasDirection = false;
     };
     std::vector<GuidePixel> guideRow(outU.w);
+    const bool sharedWorkset = job.workset &&
+        job.workset->outputWidth == outU.w && job.workset->outputHeight == outU.h;
     const bool directSparseMask = job.mask &&
         job.maskW == outU.w && job.maskH == outU.h;
     std::vector<int> sparseMaskX, sparseMaskY;
@@ -111,10 +113,9 @@ void reconstructChromaImpl(const ChromaJob &job) {
         const int my = directSparseMask ? oy : sparseMaskY[oy];
         return job.mask[size_t(my) * job.maskW + mx] != 0;
     };
-    struct ActiveSpan { int begin, end; };
-    std::vector<ActiveSpan> activeSpans;
+    std::vector<SparseSpan> activeSpans;
     std::vector<size_t> rowSpanOffsets;
-    if (job.mask) {
+    if (job.mask && !sharedWorkset) {
         ScopedCpuTimer timer(job.metrics, CpuProfileSlot::GuidedActiveRows);
         rowSpanOffsets.resize(size_t(outU.h) + 1);
         for (int oy = 0; oy < outU.h; ++oy) {
@@ -132,6 +133,25 @@ void reconstructChromaImpl(const ChromaJob &job) {
         }
         rowSpanOffsets[outU.h] = activeSpans.size();
     }
+    auto visitActive = [&](int y, auto &&function) {
+        if (sharedWorkset) {
+            for (size_t spanIndex = job.workset->outputRowOffsets[y];
+                 spanIndex < job.workset->outputRowOffsets[y + 1]; ++spanIndex) {
+                const SparseSpan span = job.workset->outputSpans[spanIndex];
+                for (int x = span.begin; x < span.end; ++x)
+                    function(x);
+            }
+        } else if (job.mask) {
+            for (size_t spanIndex = rowSpanOffsets[y];
+                 spanIndex < rowSpanOffsets[y + 1]; ++spanIndex)
+                for (int x = activeSpans[spanIndex].begin;
+                     x < activeSpans[spanIndex].end; ++x)
+                    function(x);
+        } else {
+            for (int x = 0; x < outU.w; ++x)
+                function(x);
+        }
+    };
     auto prepareGuideRow = [&](int oy) {
         if (!guided)
             return;
@@ -196,14 +216,7 @@ void reconstructChromaImpl(const ChromaJob &job) {
                 meta.mutualFade = 1.0f - msStrength * (1.0f - gate);
             }
         };
-        if (job.mask) {
-            for (size_t span = rowSpanOffsets[oy]; span < rowSpanOffsets[oy + 1]; ++span)
-                for (int ox = activeSpans[span].begin; ox < activeSpans[span].end; ++ox)
-                    preparePixel(ox);
-        } else {
-            for (int ox = 0; ox < outU.w; ++ox)
-                preparePixel(ox);
-        }
+        visitActive(oy, preparePixel);
     };
 
     for (int oy = 0; oy < outU.h; ++oy) {
@@ -217,9 +230,13 @@ void reconstructChromaImpl(const ChromaJob &job) {
 
         float *dstRowU = outU.row(oy);
         float *dstRowV = outV.row(oy);
+        size_t compressedCursor = (job.compressedSelector || job.plainHull) && sharedWorkset
+            ? job.workset->outputIndexRowOffsets[oy] : 0;
 
         ScopedCpuTimer tapTimer(job.metrics, CpuProfileSlot::GuidedTapAccumulation);
         auto processPixel = [&](int ox) {
+            const size_t compressedIndex = (job.compressedSelector || job.plainHull)
+                ? compressedCursor++ : 0;
             const int tx0 = ax.start[ox];
             const float *wxp = &ax.w[size_t(ox) * ax.sup];
             const float scx = ax.pos[ox];
@@ -243,7 +260,48 @@ void reconstructChromaImpl(const ChromaJob &job) {
             float maxAbsDL = 0.0f;
             float hullMinU = 1e30f, hullMaxU = -1e30f;
             float hullMinV = 1e30f, hullMaxV = -1e30f;
-            {
+            if (job.plainHull) {
+                hullMinU = job.plainHull->minimumU[compressedIndex];
+                hullMaxU = job.plainHull->maximumU[compressedIndex];
+                hullMinV = job.plainHull->minimumV[compressedIndex];
+                hullMaxV = job.plainHull->maximumV[compressedIndex];
+                const float *amRow = &ay.am[size_t(oy) * ay.sup];
+                const float *amCol = &ax.am[size_t(ox) * ax.sup];
+                for (int j = 0; j < ay.sup; ++j) {
+                    if (amRow[j] == 0.0f)
+                        continue;
+                    const int ty = std::clamp(ty0 + j, 0, U.h - 1);
+                    const float *lcRow = gm.lc.row(ty);
+                    int i = 0;
+#ifdef __AVX2__
+                    if (simdOK) {
+                        __m256 maximum = _mm256_setzero_ps();
+                        const __m256 luma = _mm256_set1_ps(L0);
+                        const __m256 absolute = _mm256_castsi256_ps(
+                            _mm256_set1_epi32(0x7fffffff));
+                        for (; i < ax.sup; i += 8) {
+                            const __m256i laneMask = activeLaneMask(
+                                std::min(8, ax.sup - i));
+                            const __m256 active = _mm256_maskload_ps(amCol + i, laneMask);
+                            const __m256 difference = _mm256_sub_ps(
+                                _mm256_maskload_ps(lcRow + tx0 + i, laneMask), luma);
+                            maximum = _mm256_max_ps(maximum, _mm256_and_ps(
+                                _mm256_mul_ps(difference, active), absolute));
+                        }
+                        alignas(32) float values[8];
+                        _mm256_store_ps(values, maximum);
+                        for (float value : values)
+                            maxAbsDL = std::max(maxAbsDL, value);
+                    }
+#endif
+                    for (; i < ax.sup; ++i) {
+                        if (amCol[i] == 0.0f)
+                            continue;
+                        const int tx = std::clamp(tx0 + i, 0, U.w - 1);
+                        maxAbsDL = std::max(maxAbsDL, std::fabs(lcRow[tx] - L0));
+                    }
+                }
+            } else {
                 const float *amRow = &ay.am[size_t(oy) * ay.sup];
                 const float *amCol = &ax.am[size_t(ox) * ax.sup];
                 for (int j = 0; j < ay.sup; ++j) {
@@ -701,14 +759,35 @@ void reconstructChromaImpl(const ChromaJob &job) {
                 valueV = std::clamp(valueV, double(hullMinV - margin), double(hullMaxV + margin));
             }
 
-            if (job.selectorMaps) {
+            if (job.selectorMaps || job.selectorMetadata) {
                 // selector weights: hard-edge-ness times axis/diagonal split.
                 // diag = 2|nx*ny|: 0 on axis-aligned edges, 1 at 45 degrees
                 const float diag = hasDir ? std::min(1.0f, 2.0f * std::fabs(nxv * nyv)) : 0.0f;
                 const float hedgy = (1.0f - ssRamp) * guideFade;
                 const float w2 = hedgy * (1.0f - diag) * job.selectorStrength;
                 const float w3 = hedgy * diag * job.selectorStrength;
-                if (w2 >= 1e-4f || w3 >= 1e-4f) {
+                if (job.compressedSelector) {
+                    const float baseU = job.plainU->row(oy)[ox];
+                    const float baseV = job.plainV->row(oy)[ox];
+                    if (w2 < 1e-4f && w3 < 1e-4f) {
+                        job.compressedSelector->guidedDeltaU[compressedIndex] = 0.0f;
+                        job.compressedSelector->guidedDeltaV[compressedIndex] = 0.0f;
+                        job.compressedSelector->w3[compressedIndex] = 0.0f;
+                    } else {
+                        job.compressedSelector->guidedDeltaU[compressedIndex] =
+                            hedgy * (1.0f - diag) * (float(valueU) - baseU);
+                        job.compressedSelector->guidedDeltaV[compressedIndex] =
+                            hedgy * (1.0f - diag) * (float(valueV) - baseV);
+                        job.compressedSelector->w3[compressedIndex] = hedgy * diag;
+                    }
+                } else if (job.selectorW2 && job.selectorW3) {
+                    // Algo4's first pass only emits routing metadata. LGF is
+                    // built after this pass, so inactive ROI never allocates
+                    // or evaluates its regression in the common sparse case.
+                    job.selectorW2->row(oy)[ox] =
+                        hedgy * (1.0f - diag);
+                    job.selectorW3->row(oy)[ox] = hedgy * diag;
+                } else if (job.selectorMaps && (w2 >= 1e-4f || w3 >= 1e-4f)) {
                     const LGFMaps &lgf = *job.selectorMaps;
                     const int cx = ax.chromaBilin.i0[ox];
                     const float cxf = ax.chromaBilin.f[ox];
@@ -730,17 +809,12 @@ void reconstructChromaImpl(const ChromaJob &job) {
                     valueV = dstRowV[ox];
                 }
             }
-            dstRowU[ox] = static_cast<float>(valueU);
-            dstRowV[ox] = static_cast<float>(valueV);
+            if (!job.compressedSelector) {
+                dstRowU[ox] = static_cast<float>(valueU);
+                dstRowV[ox] = static_cast<float>(valueV);
+            }
         };
-        if (job.mask) {
-            for (size_t span = rowSpanOffsets[oy]; span < rowSpanOffsets[oy + 1]; ++span)
-                for (int ox = activeSpans[span].begin; ox < activeSpans[span].end; ++ox)
-                    processPixel(ox);
-        } else {
-            for (int ox = 0; ox < outU.w; ++ox)
-                processPixel(ox);
-        }
+        visitActive(oy, processPixel);
     }
 }
 
@@ -956,15 +1030,26 @@ void plainChromaImpl(const LGCRData &d, const Plane &U, const Plane &V,
 
 template <class Backend, bool Dual>
 void plainChromaBilinear(const Plane &U, const Plane &V,
-                         Plane &outU, Plane &outV, const ChromaAxis &ax,
-                         const ChromaAxis &ay, PipelineMetrics *metrics) {
+                         Plane *outU, Plane *outV, int outputWidth,
+                         int outputHeight, const ChromaAxis &ax,
+                         const ChromaAxis &ay, PipelineMetrics *metrics,
+                         PlainPlaneRowSink rowSink = nullptr,
+                         void *rowSinkContext = nullptr) {
     const BilinAxis &bx = ax.chromaBilin;
     const BilinAxis &by = ay.chromaBilin;
-    for (int oy = 0; oy < outU.h; ++oy) {
+    Plane sinkRowU, sinkRowV;
+    if (rowSink) {
+        sinkRowU = Plane(outputWidth, 1);
+        if constexpr (Dual)
+            sinkRowV = Plane(outputWidth, 1);
+    }
+    for (int oy = 0; oy < outputHeight; ++oy) {
         const int y0 = by.i0[oy];
         const float fy = by.f[oy];
-        float *du = outU.row(oy);
-        float *dv = Dual ? outV.row(oy) : nullptr;
+        float *du = rowSink ? sinkRowU.row(0) : outU->row(oy);
+        float *dv = nullptr;
+        if constexpr (Dual)
+            dv = rowSink ? sinkRowV.row(0) : outV->row(oy);
         int ox = 0;
 #ifdef __AVX2__
         if constexpr (Backend::lanes == 8) {
@@ -1014,7 +1099,7 @@ void plainChromaBilinear(const Plane &U, const Plane &V,
                                 _mm256_fmadd_ps(vfy, _mm256_sub_ps(vbase, vt), vt));
                         }
                     }
-                } else for (; ox + 8 <= outU.w; ox += 8) {
+                } else for (; ox + 8 <= outputWidth; ox += 8) {
                     const __m256i ix = _mm256_loadu_si256(
                         reinterpret_cast<const __m256i *>(bx.i0.data() + ox));
                     const __m256 ixFrac = _mm256_loadu_ps(bx.f.data() + ox);
@@ -1040,11 +1125,13 @@ void plainChromaBilinear(const Plane &U, const Plane &V,
             }
         }
 #endif
-        for (; ox < outU.w; ++ox) {
+        for (; ox < outputWidth; ++ox) {
             du[ox] = bilinearFast(U, bx.i0[ox], bx.f[ox], y0, fy);
             if constexpr (Dual)
                 dv[ox] = bilinearFast(V, bx.i0[ox], bx.f[ox], y0, fy);
         }
+        if (rowSink)
+            rowSink(rowSinkContext, oy, du);
     }
 
     if (metrics) {
@@ -1053,7 +1140,7 @@ void plainChromaBilinear(const Plane &U, const Plane &V,
             activeX += count;
         for (uint16_t count : ay.activeTaps)
             activeY += count;
-        const uint64_t pixels = uint64_t(outU.w) * outU.h;
+        const uint64_t pixels = uint64_t(outputWidth) * outputHeight;
         const uint64_t taps = activeX * activeY;
         metrics->outputPixels += pixels;
         metrics->tapsVisited += taps;
@@ -1063,16 +1150,23 @@ void plainChromaBilinear(const Plane &U, const Plane &V,
 
 template <class Backend, bool Dual>
 void plainChromaSeparable(const LGCRData &d, const Plane &U, const Plane &V,
-                          Plane &outU, Plane &outV, const ChromaAxis &ax,
-                          const ChromaAxis &ay, PipelineMetrics *metrics) {
+                          Plane *outU, Plane *outV, int outputWidth,
+                          int outputHeight, const ChromaAxis &ax,
+                          const ChromaAxis &ay, PipelineMetrics *metrics,
+                          CompressedChromaHull *hull,
+                          const SparseWorkset *workset,
+                          PlainPlaneRowSink rowSink = nullptr,
+                          void *rowSinkContext = nullptr) {
+    const auto functionStart = std::chrono::steady_clock::now();
+    uint64_t horizontalNs = 0;
     const int horizontalRows = std::min(U.h, std::max(1, ay.sup));
-    Plane horizontalU(outU.w, horizontalRows), horizontalV;
-    Plane horizontalMinU(outU.w, horizontalRows), horizontalMaxU(outU.w, horizontalRows);
+    Plane horizontalU(outputWidth, horizontalRows), horizontalV;
+    Plane horizontalMinU(outputWidth, horizontalRows), horizontalMaxU(outputWidth, horizontalRows);
     Plane horizontalMinV, horizontalMaxV;
     if constexpr (Dual) {
-        horizontalV = Plane(outU.w, horizontalRows);
-        horizontalMinV = Plane(outU.w, horizontalRows);
-        horizontalMaxV = Plane(outU.w, horizontalRows);
+        horizontalV = Plane(outputWidth, horizontalRows);
+        horizontalMinV = Plane(outputWidth, horizontalRows);
+        horizontalMaxV = Plane(outputWidth, horizontalRows);
     }
     std::vector<int> cachedSourceRows(horizontalRows, -1);
     uint64_t horizontalRowsComputed = 0;
@@ -1082,6 +1176,7 @@ void plainChromaSeparable(const LGCRData &d, const Plane &U, const Plane &V,
     const std::vector<float> &sumAbsY = ay.absoluteWeightSum;
 
     auto computeHorizontalRow = [&](int sourceY) {
+        const auto horizontalStart = std::chrono::steady_clock::now();
         const int slot = sourceY % horizontalRows;
         const float *sourceU = U.row(sourceY);
         const float *sourceV = Dual ? V.row(sourceY) : nullptr;
@@ -1093,7 +1188,7 @@ void plainChromaSeparable(const LGCRData &d, const Plane &U, const Plane &V,
             const __m256 negativeInfinity = _mm256_set1_ps(-1e30f);
             const __m256i zeroIndex = _mm256_setzero_si256();
             const __m256i lastIndex = _mm256_set1_epi32(U.w - 1);
-            for (; ox + 8 <= outU.w; ox += 8) {
+            for (; ox + 8 <= outputWidth; ox += 8) {
                 const __m256i starts = _mm256_loadu_si256(
                     reinterpret_cast<const __m256i *>(ax.start.data() + ox));
                 __m256 valueU = zero, valueV = zero;
@@ -1136,7 +1231,7 @@ void plainChromaSeparable(const LGCRData &d, const Plane &U, const Plane &V,
             }
         }
 #endif
-        for (; ox < outU.w; ++ox) {
+        for (; ox < outputWidth; ++ox) {
             const int start = ax.start[ox];
             const float *weights = &ax.w[size_t(ox) * ax.sup];
             const float *activity = &ax.am[size_t(ox) * ax.sup];
@@ -1168,11 +1263,26 @@ void plainChromaSeparable(const LGCRData &d, const Plane &U, const Plane &V,
         }
         cachedSourceRows[slot] = sourceY;
         ++horizontalRowsComputed;
+        if (metrics) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - horizontalStart).count();
+            horizontalNs += static_cast<uint64_t>(elapsed);
+        }
     };
 
     const bool clampHull = d.arMargin >= 0.0;
     const float margin = float(std::max(0.0, d.arMargin));
-    for (int oy = 0; oy < outU.h; ++oy) {
+    Plane sinkRowU, sinkRowV;
+    if (rowSink) {
+        sinkRowU = Plane(outputWidth, 1);
+        if constexpr (Dual)
+            sinkRowV = Plane(outputWidth, 1);
+    }
+    for (int oy = 0; oy < outputHeight; ++oy) {
+        float *outputRowU = rowSink ? sinkRowU.row(0) : outU->row(oy);
+        float *outputRowV = nullptr;
+        if constexpr (Dual)
+            outputRowV = rowSink ? sinkRowV.row(0) : outV->row(oy);
         const int start = ay.start[oy];
         const float *weights = &ay.w[size_t(oy) * ay.sup];
         const float *activity = &ay.am[size_t(oy) * ay.sup];
@@ -1185,6 +1295,13 @@ void plainChromaSeparable(const LGCRData &d, const Plane &U, const Plane &V,
                 computeHorizontalRow(sourceY);
         }
         int ox = 0;
+        size_t hullIndex = hull && workset
+            ? workset->outputIndexRowOffsets[oy] : 0;
+        const size_t hullEnd = hull && workset
+            ? workset->outputIndexRowOffsets[oy + 1] : 0;
+        auto activeHullX = [&]() {
+            return int(workset->outputIndices[hullIndex] % unsigned(outputWidth));
+        };
 #ifdef __AVX2__
         if constexpr (Backend::lanes == 8) {
             const __m256 rowSum = _mm256_set1_ps(sumY[oy]);
@@ -1192,7 +1309,7 @@ void plainChromaSeparable(const LGCRData &d, const Plane &U, const Plane &V,
             const __m256 epsilon = _mm256_set1_ps(1e-6f);
             const __m256 cancellation = _mm256_set1_ps(0.05f);
             const __m256 marginVec = _mm256_set1_ps(margin);
-            for (; ox + 8 <= outU.w; ox += 8) {
+            for (; ox + 8 <= outputWidth; ox += 8) {
                 const __m256 weightSum = _mm256_mul_ps(
                     _mm256_loadu_ps(sumX.data() + ox), rowSum);
                 const __m256 absoluteSum = _mm256_mul_ps(
@@ -1231,13 +1348,32 @@ void plainChromaSeparable(const LGCRData &d, const Plane &U, const Plane &V,
                             maximumV, _mm256_loadu_ps(horizontalMaxV.row(slot) + ox));
                     }
                 }
+                if (hullIndex < hullEnd && activeHullX() < ox + 8) {
+                    alignas(32) float minU[8], maxU[8], minV[8], maxV[8];
+                    _mm256_store_ps(minU, minimumU);
+                    _mm256_store_ps(maxU, maximumU);
+                    if constexpr (Dual) {
+                        _mm256_store_ps(minV, minimumV);
+                        _mm256_store_ps(maxV, maximumV);
+                    }
+                    while (hullIndex < hullEnd && activeHullX() < ox + 8) {
+                        const int lane = activeHullX() - ox;
+                        hull->minimumU[hullIndex] = minU[lane];
+                        hull->maximumU[hullIndex] = maxU[lane];
+                        if constexpr (Dual) {
+                            hull->minimumV[hullIndex] = minV[lane];
+                            hull->maximumV[hullIndex] = maxV[lane];
+                        }
+                        ++hullIndex;
+                    }
+                }
                 valueU = _mm256_div_ps(valueU, weightSum);
                 if (clampHull) {
                     valueU = _mm256_max_ps(_mm256_sub_ps(minimumU, marginVec),
                                            _mm256_min_ps(valueU,
                                                _mm256_add_ps(maximumU, marginVec)));
                 }
-                _mm256_storeu_ps(outU.row(oy) + ox, valueU);
+                _mm256_storeu_ps(outputRowU + ox, valueU);
                 if constexpr (Dual) {
                     valueV = _mm256_div_ps(valueV, weightSum);
                     if (clampHull) {
@@ -1245,12 +1381,12 @@ void plainChromaSeparable(const LGCRData &d, const Plane &U, const Plane &V,
                                                _mm256_min_ps(valueV,
                                                    _mm256_add_ps(maximumV, marginVec)));
                     }
-                    _mm256_storeu_ps(outV.row(oy) + ox, valueV);
+                    _mm256_storeu_ps(outputRowV + ox, valueV);
                 }
             }
         }
 #endif
-        for (; ox < outU.w; ++ox) {
+        for (; ox < outputWidth; ++ox) {
             double valueU = 0.0, valueV = 0.0;
             float minimumU = 1e30f, maximumU = -1e30f;
             float minimumV = 1e30f, maximumV = -1e30f;
@@ -1284,23 +1420,40 @@ void plainChromaSeparable(const LGCRData &d, const Plane &U, const Plane &V,
                                     double(maximumU + margin));
                 if constexpr (Dual)
                     valueV = std::clamp(valueV, double(minimumV - margin),
-                                        double(maximumV + margin));
+                                    double(maximumV + margin));
             }
-            outU.row(oy)[ox] = static_cast<float>(valueU);
+            if (hullIndex < hullEnd && activeHullX() == ox) {
+                hull->minimumU[hullIndex] = minimumU;
+                hull->maximumU[hullIndex] = maximumU;
+                if constexpr (Dual) {
+                    hull->minimumV[hullIndex] = minimumV;
+                    hull->maximumV[hullIndex] = maximumV;
+                }
+                ++hullIndex;
+            }
+            outputRowU[ox] = static_cast<float>(valueU);
             if constexpr (Dual)
-                outV.row(oy)[ox] = static_cast<float>(valueV);
+                outputRowV[ox] = static_cast<float>(valueV);
         }
+        if (rowSink)
+            rowSink(rowSinkContext, oy, outputRowU);
     }
 
     if (metrics) {
-        const uint64_t pixels = uint64_t(outU.w) * outU.h;
+        const auto totalNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - functionStart).count());
+        metrics->add(CpuProfileSlot::PlainHorizontal, horizontalNs);
+        metrics->add(CpuProfileSlot::PlainVertical,
+                     totalNs > horizontalNs ? totalNs - horizontalNs : 0);
+        const uint64_t pixels = uint64_t(outputWidth) * outputHeight;
         uint64_t activeHorizontal = 0, activeVertical = 0;
         for (uint16_t count : ax.activeTaps)
             activeHorizontal += count;
         for (uint16_t count : ay.activeTaps)
             activeVertical += count;
         const uint64_t taps = horizontalRowsComputed * activeHorizontal +
-                              uint64_t(outU.w) * activeVertical;
+                              uint64_t(outputWidth) * activeVertical;
         metrics->outputPixels += pixels;
         metrics->tapsVisited += taps;
         metrics->addWork(Stage::BuildBaseChroma, pixels, taps);
@@ -1316,7 +1469,9 @@ void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
                         const Plane &y, const GuideMaps &gm,
                         int sw, int sh, int cw, int ch,
                         Plane &cOutU, Plane &cOutV,
-                        PipelineMetrics *metrics) {
+                        PipelineMetrics *metrics,
+                        CompressedChromaHull *hull,
+                        const SparseWorkset *workset) {
     (void)y;
     (void)gm;
     const double rw = double(sw) / cw, rh = double(sh) / ch;
@@ -1327,11 +1482,12 @@ void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
         plainChromaImpl<NativeBackend, true>(*d, cb, cr, cOutU, cOutV,
                                              *ax, *ay, radialWeights.get(), metrics);
     } else if (d->kernel == Kernel::Bilinear)
-        plainChromaBilinear<NativeBackend, true>(cb, cr, cOutU, cOutV,
-                                                 *ax, *ay, metrics);
+        plainChromaBilinear<NativeBackend, true>(
+            cb, cr, &cOutU, &cOutV, cOutU.w, cOutU.h, *ax, *ay, metrics);
     else
         plainChromaSeparable<NativeBackend, true>(
-            *d, cb, cr, cOutU, cOutV, *ax, *ay, metrics);
+            *d, cb, cr, &cOutU, &cOutV, cOutU.w, cOutU.h,
+            *ax, *ay, metrics, hull, workset);
 }
 
 void plainPlane(const LGCRData *d, const Plane &src,
@@ -1344,24 +1500,60 @@ void plainPlane(const LGCRData *d, const Plane &src,
         plainChromaImpl<NativeBackend, false>(*d, src, src, dst, dst,
                                               *ax, *ay, radialWeights.get(), nullptr);
     } else if (d->kernel == Kernel::Bilinear)
-        plainChromaBilinear<NativeBackend, false>(src, src, dst, dst,
-                                                  *ax, *ay, nullptr);
+        plainChromaBilinear<NativeBackend, false>(
+            src, src, &dst, &dst, dst.w, dst.h, *ax, *ay, nullptr);
     else
         plainChromaSeparable<NativeBackend, false>(
-            *d, src, src, dst, dst, *ax, *ay, nullptr);
+            *d, src, src, &dst, &dst, dst.w, dst.h,
+            *ax, *ay, nullptr, nullptr, nullptr);
+}
+
+void plainPlaneRows(const LGCRData *d, const Plane &src,
+                    int sw, int sh, int cw, int ch,
+                    PlainPlaneRowSink sink, void *context) {
+    const double rw = double(sw) / cw, rh = double(sh) / ch;
+    const auto ax = cachedChromaAxis(d, sw, sw, rw, d->shiftX);
+    const auto ay = cachedChromaAxis(d, sh, sh, rh, d->shiftY);
+    if (d->kernel == Kernel::Bilinear)
+        plainChromaBilinear<NativeBackend, false>(
+            src, src, nullptr, nullptr, sw, sh, *ax, *ay, nullptr,
+            sink, context);
+    else
+        plainChromaSeparable<NativeBackend, false>(
+            *d, src, src, nullptr, nullptr, sw, sh,
+            *ax, *ay, nullptr, nullptr, nullptr, sink, context);
 }
 
 // LGF coefficient planes for the internal algo=4 selector branch.
 
 
 LGFMaps buildLGFMaps(const LGCRData *d, const Plane &y, const Plane &cb,
-                            const Plane &cr, int cw, int ch, double rw, double rh) {
-    LGFMaps m(cw, ch);
+                     const Plane &cr, int cw, int ch, double rw, double rh,
+                     PipelineMetrics *metrics, const uint8_t *roiMask,
+                     int roiStride, FrameScratchAllocator *scratch) {
+    LGFMaps m;
+    m.aU = scratchPlane(scratch, cw, ch);
+    m.bU = scratchPlane(scratch, cw, ch);
+    m.confU = scratchPlane(scratch, cw, ch);
+    m.aV = scratchPlane(scratch, cw, ch);
+    m.bV = scratchPlane(scratch, cw, ch);
+    m.confV = scratchPlane(scratch, cw, ch);
+    if (roiMask) {
+        m.aU.fill(0.0f);
+        m.bU.fill(0.0f);
+        m.confU.fill(0.0f);
+        m.aV.fill(0.0f);
+        m.bV.fill(0.0f);
+        m.confV.fill(0.0f);
+    }
     // buildLGFPair lives in algos.cpp so both chroma planes share luma samples
     // and a single rolling-window traversal.
-    buildLGFPair(y, cw, ch, rw, rh, d->shiftX, d->shiftY, cb, cr, 2,
-                 d->reg * d->reg, m.aU, m.bU, m.confU,
-                 m.aV, m.bV, m.confV, d->cedge);
+    {
+        ScopedCpuTimer timer(metrics, CpuProfileSlot::LGFMoments);
+        buildLGFPair(y, cw, ch, rw, rh, d->shiftX, d->shiftY, cb, cr, 2,
+                     d->reg * d->reg, m.aU, m.bU, m.confU,
+                     m.aV, m.bV, m.confV, d->cedge, roiMask, roiStride);
+    }
     return m;
 }
 

@@ -367,7 +367,8 @@ void buildLGFPair(const Plane &Y, int cw, int ch, double rw, double rh,
                   double shiftX, double shiftY, const Plane &U, const Plane &V,
                   int radius, double eps,
                   Plane &aU, Plane &bU, Plane &confU,
-                  Plane &aV, Plane &bV, Plane &confV, bool cedge) {
+                  Plane &aV, Plane &bV, Plane &confV, bool cedge,
+                  const uint8_t *roiMask, int roiStride) {
     Plane ls = pointSampledLuma(Y, cw, ch, rw, rh, shiftX, shiftY);
     Plane minU, maxU, minV, maxV;
     if (cedge) {
@@ -377,13 +378,7 @@ void buildLGFPair(const Plane &Y, int cw, int ch, double rw, double rh,
         slidingMinMax(V, radius, minV, maxV);
     }
 
-    forEachWindowSum<6>(cw, ch, radius,
-        [&](int x, int y, std::array<double, 6> &values) {
-            const double ly = ls.row(y)[x];
-            const double u = U.row(y)[x], v = V.row(y)[x];
-            values = { ly, ly * ly, u, ly * u, v, ly * v };
-        },
-        [&](int x, int y, int n, const std::array<double, 6> &sum) {
+    auto consume = [&](int x, int y, int n, const std::array<double, 6> &sum) {
             const double meanY = sum[0] / n;
             const double var = sum[1] / n - meanY * meanY;
             const double meanU = sum[2] / n, meanV = sum[4] / n;
@@ -416,6 +411,39 @@ void buildLGFPair(const Plane &Y, int cw, int ch, double rw, double rh,
             }
             confU.row(y)[x] = confidenceU;
             confV.row(y)[x] = confidenceV;
+    };
+
+    bool denseRoi = !roiMask;
+    if (roiMask) {
+        size_t active = 0;
+        for (int y = 0; y < ch; ++y)
+            for (int x = 0; x < cw; ++x)
+                active += roiMask[size_t(y) * roiStride + x] != 0;
+        denseRoi = active * 2 >= size_t(cw) * ch;
+    }
+    if (!roiMask || denseRoi) {
+        forEachWindowSum<6>(cw, ch, radius,
+            [&](int x, int y, std::array<double, 6> &values) {
+                const double ly = ls.row(y)[x];
+                const double u = U.row(y)[x], v = V.row(y)[x];
+                values = { ly, ly * ly, u, ly * u, v, ly * v };
+            }, consume);
+        return;
+    }
+
+    // Keep the rolling accumulation order used by the dense/reference path.
+    // Even a few ulps of reordering can cross an integer-output quantization
+    // boundary. The expensive regression finalize and all stores remain ROI
+    // only; the rolling moment state itself is O(width).
+    forEachWindowSum<6>(cw, ch, radius,
+        [&](int x, int y, std::array<double, 6> &values) {
+            const double ly = ls.row(y)[x];
+            const double u = U.row(y)[x], v = V.row(y)[x];
+            values = { ly, ly * ly, u, ly * u, v, ly * v };
+        },
+        [&](int x, int y, int n, const std::array<double, 6> &sum) {
+            if (roiMask[size_t(y) * roiStride + x] != 0)
+                consume(x, y, n, sum);
         });
 }
 
@@ -472,10 +500,96 @@ void blendSelector(Plane &outU, Plane &outV,
                    const Plane &confU, const Plane &confV, const Plane &Y,
                    const ChromaAxis &ax, const ChromaAxis &ay,
                    const Plane &w2, const Plane &w3,
-                   int cw, int ch, float lam) {
-    blendSelectorImpl<NativeBackend>(outU, outV, gU, gV, aU, bU, aV, bV,
-                                     confU, confV, Y, ax, ay, w2, w3,
-                                     cw, ch, lam);
+                   int cw, int ch, float lam,
+                   const SparseWorkset *workset, PipelineMetrics *metrics) {
+    ScopedCpuTimer timer(metrics, CpuProfileSlot::GuidedNormalizationSelector);
+    if (!workset) {
+        blendSelectorImpl<NativeBackend>(outU, outV, gU, gV, aU, bU, aV, bV,
+                                         confU, confV, Y, ax, ay, w2, w3,
+                                         cw, ch, lam);
+        return;
+    }
+    const BilinAxis &bcx = ax.chromaBilin;
+    const BilinAxis &bcy = ay.chromaBilin;
+    const BilinAxis &blx = ax.lumaBilin;
+    const BilinAxis &bly = ay.lumaBilin;
+    for (int oy = 0; oy < outU.h; ++oy) {
+        float *ru = outU.row(oy);
+        float *rv = outV.row(oy);
+        const int cyi = bcy.i0[oy], lyi = bly.i0[oy];
+        const float cyf = bcy.f[oy], lyf = bly.f[oy];
+        for (size_t spanIndex = workset->outputRowOffsets[oy];
+             spanIndex < workset->outputRowOffsets[oy + 1]; ++spanIndex) {
+            const SparseSpan span = workset->outputSpans[spanIndex];
+            for (int ox = span.begin; ox < span.end; ++ox) {
+                const float w2v = w2.row(oy)[ox] * lam;
+                const float w3v = w3.row(oy)[ox] * lam;
+                if (w2v < 1e-4f && w3v < 1e-4f)
+                    continue;
+                const float L0 = bilinearFast(Y, blx.i0[ox], blx.f[ox], lyi, lyf);
+                const int cxi = bcx.i0[ox];
+                const float cxf = bcx.f[ox];
+                const float au = bilinearFast(aU, cxi, cxf, cyi, cyf);
+                const float bu = bilinearFast(bU, cxi, cxf, cyi, cyf);
+                const float av = bilinearFast(aV, cxi, cxf, cyi, cyf);
+                const float bv = bilinearFast(bV, cxi, cxf, cyi, cyf);
+                const float cu = bilinearFast(confU, cxi, cxf, cyi, cyf);
+                const float cv = bilinearFast(confV, cxi, cxf, cyi, cyf);
+                ru[ox] += w2v * (gU.row(oy)[ox] - ru[ox])
+                    + w3v * cu * (au * L0 + bu - ru[ox]);
+                rv[ox] += w2v * (gV.row(oy)[ox] - rv[ox])
+                    + w3v * cv * (av * L0 + bv - rv[ox]);
+            }
+        }
+    }
+}
+
+void blendSelectorCompressed(Plane &outU, Plane &outV,
+                             const CompressedSelector &selector,
+                             const Plane &aU, const Plane &bU,
+                             const Plane &aV, const Plane &bV,
+                             const Plane &confU, const Plane &confV,
+                             const Plane &Y, const ChromaAxis &ax,
+                             const ChromaAxis &ay,
+                             const SparseWorkset &workset, float lam,
+                             PipelineMetrics *metrics) {
+    ScopedCpuTimer timer(metrics, CpuProfileSlot::GuidedNormalizationSelector);
+    const BilinAxis &bcx = ax.chromaBilin;
+    const BilinAxis &bcy = ay.chromaBilin;
+    const BilinAxis &blx = ax.lumaBilin;
+    const BilinAxis &bly = ay.lumaBilin;
+    for (int oy = 0; oy < outU.h; ++oy) {
+        float *ru = outU.row(oy), *rv = outV.row(oy);
+        const int cy = bcy.i0[oy], ly = bly.i0[oy];
+        const float cyf = bcy.f[oy], lyf = bly.f[oy];
+        size_t index = workset.outputIndexRowOffsets[oy];
+        for (size_t spanIndex = workset.outputRowOffsets[oy];
+             spanIndex < workset.outputRowOffsets[oy + 1]; ++spanIndex) {
+            const SparseSpan span = workset.outputSpans[spanIndex];
+            for (int ox = span.begin; ox < span.end; ++ox, ++index) {
+                const float plainU = ru[ox], plainV = rv[ox];
+                const float w3 = lam * selector.w3[index];
+                float valueU = plainU + lam * selector.guidedDeltaU[index];
+                float valueV = plainV + lam * selector.guidedDeltaV[index];
+                if (w3 != 0.0f) {
+                    const int cx = bcx.i0[ox];
+                    const float cxf = bcx.f[ox];
+                    const float luma = bilinearFast(
+                        Y, blx.i0[ox], blx.f[ox], ly, lyf);
+                    const float au = bilinearFast(aU, cx, cxf, cy, cyf);
+                    const float bu = bilinearFast(bU, cx, cxf, cy, cyf);
+                    const float av = bilinearFast(aV, cx, cxf, cy, cyf);
+                    const float bv = bilinearFast(bV, cx, cxf, cy, cyf);
+                    const float cu = bilinearFast(confU, cx, cxf, cy, cyf);
+                    const float cv = bilinearFast(confV, cx, cxf, cy, cyf);
+                    valueU += w3 * cu * (au * luma + bu - plainU);
+                    valueV += w3 * cv * (av * luma + bv - plainV);
+                }
+                ru[ox] = valueU;
+                rv[ox] = valueV;
+            }
+        }
+    }
 }
 
 void sharpenPlane(Plane &p, const Plane *guideLc, const Plane &guideY,
@@ -702,7 +816,8 @@ static float median3(float a, float b, float c) {
 
 #ifdef __AVX2__
 void affineFixed5Avx2(const Plane &cb, const Plane &cr,
-                      const std::array<Plane, 3> &yc, double eps, double epsSig,
+                      const std::array<const Plane *, 3> &yc,
+                      double eps, double epsSig,
                       AffineMaps &m) {
     constexpr int momentCount = 16;
     constexpr int ringRows = 5;
@@ -723,7 +838,7 @@ void affineFixed5Avx2(const Plane &cb, const Plane &cr,
             ringPlane(0, y)[x] = u; ringPlane(1, y)[x] = u * u;
             ringPlane(2, y)[x] = v; ringPlane(3, y)[x] = v * v;
             for (int k = 0; k < 3; ++k) {
-                const double ly = yc[k].row(y)[x];
+                const double ly = yc[k]->row(y)[x];
                 const int base = 4 + 4 * k;
                 ringPlane(base, y)[x] = ly;
                 ringPlane(base + 1, y)[x] = ly * ly;
@@ -731,7 +846,7 @@ void affineFixed5Avx2(const Plane &cb, const Plane &cr,
                 ringPlane(base + 3, y)[x] = ly * v;
             }
             m.degradedLuma.row(y)[x] = median3(
-                yc[0].row(y)[x], yc[1].row(y)[x], yc[2].row(y)[x]);
+                yc[0]->row(y)[x], yc[1]->row(y)[x], yc[2]->row(y)[x]);
         }
         for (int k = 0; k < momentCount; ++k) {
             double *dst = column(k);
@@ -791,6 +906,80 @@ void affineFixed5Avx2(const Plane &cb, const Plane &cr,
         m.g.row(y)[x] = float((qsum / 3.0) * stability * chromaSignal);
     };
 
+    auto consume4 = [&](int x, int y, int count,
+                        const double (&sum)[momentCount][4]) {
+        const __m256d zero = _mm256_setzero_pd();
+        const __m256d one = _mm256_set1_pd(1.0);
+        const __m256d inverseCount = _mm256_set1_pd(1.0 / count);
+        const __m256d meanU = _mm256_mul_pd(_mm256_load_pd(sum[0]), inverseCount);
+        const __m256d meanV = _mm256_mul_pd(_mm256_load_pd(sum[2]), inverseCount);
+        const __m256d varU = _mm256_max_pd(zero, _mm256_sub_pd(
+            _mm256_mul_pd(_mm256_load_pd(sum[1]), inverseCount),
+            _mm256_mul_pd(meanU, meanU)));
+        const __m256d varV = _mm256_max_pd(zero, _mm256_sub_pd(
+            _mm256_mul_pd(_mm256_load_pd(sum[3]), inverseCount),
+            _mm256_mul_pd(meanV, meanV)));
+        const __m128 rangeU = _mm_sub_ps(
+            _mm_loadu_ps(m.mxU.row(y) + x), _mm_loadu_ps(m.mnU.row(y) + x));
+        const __m128 rangeV = _mm_sub_ps(
+            _mm_loadu_ps(m.mxV.row(y) + x), _mm_loadu_ps(m.mnV.row(y) + x));
+        _mm_storeu_ps(m.rng.row(y) + x, _mm_max_ps(rangeU, rangeV));
+
+        __m256d q[3], slopeU[3], slopeV[3];
+        const __m256d chromaVariance = _mm256_add_pd(varU, varV);
+        for (int k = 0; k < 3; ++k) {
+            const int base = 4 + 4 * k;
+            const __m256d meanY = _mm256_mul_pd(
+                _mm256_load_pd(sum[base]), inverseCount);
+            const __m256d varY = _mm256_max_pd(zero, _mm256_sub_pd(
+                _mm256_mul_pd(_mm256_load_pd(sum[base + 1]), inverseCount),
+                _mm256_mul_pd(meanY, meanY)));
+            const __m256d covU = _mm256_sub_pd(
+                _mm256_mul_pd(_mm256_load_pd(sum[base + 2]), inverseCount),
+                _mm256_mul_pd(meanY, meanU));
+            const __m256d covV = _mm256_sub_pd(
+                _mm256_mul_pd(_mm256_load_pd(sum[base + 3]), inverseCount),
+                _mm256_mul_pd(meanY, meanV));
+            const __m256d regularizedY = _mm256_add_pd(varY, _mm256_set1_pd(eps));
+            const __m256d minimumSlope = _mm256_set1_pd(-16.0);
+            const __m256d maximumSlope = _mm256_set1_pd(16.0);
+            slopeU[k] = _mm256_max_pd(minimumSlope, _mm256_min_pd(
+                maximumSlope, _mm256_div_pd(covU, regularizedY)));
+            slopeV[k] = _mm256_max_pd(minimumSlope, _mm256_min_pd(
+                maximumSlope, _mm256_div_pd(covV, regularizedY)));
+            const __m256d numerator = _mm256_add_pd(
+                _mm256_mul_pd(covU, covU), _mm256_mul_pd(covV, covV));
+            const __m256d denominator = _mm256_mul_pd(
+                regularizedY,
+                _mm256_add_pd(chromaVariance, _mm256_set1_pd(eps)));
+            q[k] = _mm256_max_pd(zero, _mm256_min_pd(
+                one, _mm256_div_pd(numerator, denominator)));
+        }
+        auto medianVector = [](__m256d a, __m256d b, __m256d c) {
+            const __m256d minimum = _mm256_min_pd(a, _mm256_min_pd(b, c));
+            const __m256d maximum = _mm256_max_pd(a, _mm256_max_pd(b, c));
+            return _mm256_sub_pd(_mm256_sub_pd(_mm256_add_pd(a, b), minimum),
+                                 _mm256_sub_pd(maximum, c));
+        };
+        _mm_storeu_ps(m.aU.row(y) + x, _mm256_cvtpd_ps(
+            medianVector(slopeU[0], slopeU[1], slopeU[2])));
+        _mm_storeu_ps(m.aV.row(y) + x, _mm256_cvtpd_ps(
+            medianVector(slopeV[0], slopeV[1], slopeV[2])));
+
+        const __m256d qsum = _mm256_add_pd(_mm256_add_pd(q[0], q[1]), q[2]);
+        const __m256d qmax = _mm256_max_pd(q[0], _mm256_max_pd(q[1], q[2]));
+        const __m256d qmin = _mm256_min_pd(q[0], _mm256_min_pd(q[1], q[2]));
+        const __m256d stability = _mm256_blendv_pd(
+            zero, _mm256_div_pd(qmin, qmax),
+            _mm256_cmp_pd(qmax, _mm256_set1_pd(1e-9), _CMP_GT_OQ));
+        const __m256d chromaSignal = _mm256_div_pd(
+            chromaVariance, _mm256_add_pd(chromaVariance, _mm256_set1_pd(epsSig)));
+        const __m256d confidence = _mm256_mul_pd(
+            _mm256_mul_pd(qsum, _mm256_set1_pd(1.0 / 3.0)),
+            _mm256_mul_pd(stability, chromaSignal));
+        _mm_storeu_ps(m.g.row(y) + x, _mm256_cvtpd_ps(confidence));
+    };
+
     for (int y = 0; y < height; ++y) {
         const int top = std::max(0, y - 2);
         const int bottom = std::min(height - 1, y + 2);
@@ -819,12 +1008,7 @@ void affineFixed5Avx2(const Plane &cb, const Plane &cr,
                 value = _mm256_add_pd(value, _mm256_loadu_pd(c + 2));
                 _mm256_store_pd(sums[k], value);
             }
-            for (int lane = 0; lane < 4; ++lane) {
-                double one[momentCount];
-                for (int k = 0; k < momentCount; ++k)
-                    one[k] = sums[k][lane];
-                consume(x + lane, y, 5 * verticalCount, one);
-            }
+            consume4(x, y, 5 * verticalCount, sums);
         }
         for (; x < width; ++x) {
             double one[momentCount]{};
@@ -839,36 +1023,342 @@ void affineFixed5Avx2(const Plane &cb, const Plane &cr,
 }
 #endif
 
-static Plane suppressSourceNyquist(Plane cur, double rw, double rh) {
-    auto levelsFor = [](double ratio) {
-        int levels = 0;
-        while (ratio > 1.5 && levels < 4) {
-            ratio *= 0.5;
-            ++levels;
+void affineSparseFixed5(const Plane &cb, const Plane &cr,
+                        const std::array<const Plane *, 3> &yc,
+                        double eps, double epsSig, const SparseWorkset &workset,
+                        AffineMaps &m, PipelineMetrics *metrics) {
+    constexpr int momentCount = 16;
+    const int width = cb.w, height = cb.h;
+    const auto functionStart = std::chrono::steady_clock::now();
+    uint64_t consumeNs = 0;
+    std::vector<std::array<double, momentCount>> rowSums(width);
+    std::vector<int> counts(width);
+    struct Hull { float minU, maxU, minV, maxV; };
+    std::vector<Hull> hulls(width);
+
+    for (int y = 0; y < height; ++y) {
+        for (size_t spanIndex = workset.chromaRowOffsets[y];
+             spanIndex < workset.chromaRowOffsets[y + 1]; ++spanIndex) {
+            const SparseSpan span = workset.chromaSpans[spanIndex];
+            for (int x = span.begin; x < span.end; ++x) {
+                auto &sum = rowSums[x];
+                sum.fill(0.0);
+                const int top = std::max(0, y - 2);
+                const int bottom = std::min(height - 1, y + 2);
+                const int left = std::max(0, x - 2);
+                const int right = std::min(width - 1, x + 2);
+                Hull hull{cb.row(top)[left], cb.row(top)[left],
+                          cr.row(top)[left], cr.row(top)[left]};
+                for (int py = top; py <= bottom; ++py) {
+                    for (int px = left; px <= right; ++px) {
+                        const double u = cb.row(py)[px], v = cr.row(py)[px];
+                        sum[0] += u; sum[1] += u * u;
+                        sum[2] += v; sum[3] += v * v;
+                        hull.minU = std::min(hull.minU, float(u));
+                        hull.maxU = std::max(hull.maxU, float(u));
+                        hull.minV = std::min(hull.minV, float(v));
+                        hull.maxV = std::max(hull.maxV, float(v));
+                        for (int k = 0; k < 3; ++k) {
+                            const double ly = yc[k]->row(py)[px];
+                            const int base = 4 + 4 * k;
+                            sum[base] += ly;
+                            sum[base + 1] += ly * ly;
+                            sum[base + 2] += ly * u;
+                            sum[base + 3] += ly * v;
+                        }
+                    }
+                }
+                counts[x] = (right - left + 1) * (bottom - top + 1);
+                hulls[x] = hull;
+            }
         }
-        return levels;
+
+        const auto consumeStart = std::chrono::steady_clock::now();
+        for (size_t spanIndex = workset.chromaRowOffsets[y];
+             spanIndex < workset.chromaRowOffsets[y + 1]; ++spanIndex) {
+            const SparseSpan span = workset.chromaSpans[spanIndex];
+            for (int x = span.begin; x < span.end; ++x) {
+                const auto &sum = rowSums[x];
+                const double inverseCount = 1.0 / counts[x];
+                const double meanU = sum[0] * inverseCount;
+                const double meanV = sum[2] * inverseCount;
+                const double varU = std::max(
+                    0.0, sum[1] * inverseCount - meanU * meanU);
+                const double varV = std::max(
+                    0.0, sum[3] * inverseCount - meanV * meanV);
+                const Hull hull = hulls[x];
+                m.mnU.row(y)[x] = hull.minU; m.mxU.row(y)[x] = hull.maxU;
+                m.mnV.row(y)[x] = hull.minV; m.mxV.row(y)[x] = hull.maxV;
+                m.rng.row(y)[x] = std::max(
+                    hull.maxU - hull.minU, hull.maxV - hull.minV);
+
+                double q[3], slopeU[3], slopeV[3];
+                for (int k = 0; k < 3; ++k) {
+                    const int base = 4 + 4 * k;
+                    const double meanY = sum[base] * inverseCount;
+                    const double varY = std::max(
+                        0.0, sum[base + 1] * inverseCount - meanY * meanY);
+                    const double covU = sum[base + 2] * inverseCount - meanY * meanU;
+                    const double covV = sum[base + 3] * inverseCount - meanY * meanV;
+                    slopeU[k] = std::clamp(covU / (varY + eps), -16.0, 16.0);
+                    slopeV[k] = std::clamp(covV / (varY + eps), -16.0, 16.0);
+                    q[k] = std::clamp(
+                        (covU * covU + covV * covV) /
+                            ((varY + eps) * (varU + varV + eps)),
+                        0.0, 1.0);
+                }
+                m.aU.row(y)[x] = median3(
+                    float(slopeU[0]), float(slopeU[1]), float(slopeU[2]));
+                m.aV.row(y)[x] = median3(
+                    float(slopeV[0]), float(slopeV[1]), float(slopeV[2]));
+                const double qmax = std::max({q[0], q[1], q[2]});
+                const double qmin = std::min({q[0], q[1], q[2]});
+                const double stability = qmax > 1e-9 ? qmin / qmax : 0.0;
+                const double chromaSignal =
+                    (varU + varV) / (varU + varV + epsSig);
+                m.g.row(y)[x] = float(
+                    ((q[0] + q[1] + q[2]) / 3.0) * stability * chromaSignal);
+            }
+        }
+        if (metrics) {
+            consumeNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - consumeStart).count());
+        }
+    }
+    if (metrics) {
+        const uint64_t totalNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - functionStart).count());
+        metrics->add(CpuProfileSlot::AffineRolling,
+                     totalNs > consumeNs ? totalNs - consumeNs : 0);
+        metrics->add(CpuProfileSlot::AffineConsume, consumeNs);
+    }
+}
+
+static int nyquistLevels(double ratio) {
+    int levels = 0;
+    while (ratio > 1.5 && levels < 4) {
+        ratio *= 0.5;
+        ++levels;
+    }
+    return levels;
+}
+
+class VerticalNyquistPipeline {
+public:
+    VerticalNyquistPipeline(int width, int height, int levelCount, Plane &output)
+        : width_(width), height_(height), output_(output) {
+        levels_.reserve(levelCount);
+        for (int pass = 0; pass < levelCount; ++pass) {
+            const int step = 1 << pass;
+            levels_.emplace_back(width, std::min(height, 2 * step + 1), step);
+        }
+    }
+
+    void push(int y, const float *row) {
+        if (levels_.empty()) {
+            std::copy_n(row, width_, output_.row(y));
+            return;
+        }
+        pushLevel(0, y, row);
+    }
+
+    void finish() {
+        for (size_t level = 0; level < levels_.size(); ++level) {
+            Level &state = levels_[level];
+            while (state.emitted < height_)
+                emit(level, state.emitted++);
+        }
+    }
+
+private:
+    struct Level {
+        Level(int width, int ringRows, int step_)
+            : ring(width, ringRows), scratch(width, 1), step(step_) {}
+
+        Plane ring;
+        Plane scratch;
+        int step = 0;
+        int received = 0;
+        int emitted = 0;
     };
-    const int xLevels = levelsFor(rw);
-    const int yLevels = levelsFor(rh);
+
+    void pushLevel(size_t level, int y, const float *row) {
+        Level &state = levels_[level];
+        std::copy_n(row, width_, state.ring.row(y % state.ring.h));
+        state.received = y + 1;
+        while (state.emitted + state.step < state.received)
+            emit(level, state.emitted++);
+    }
+
+    void emit(size_t level, int y) {
+        Level &state = levels_[level];
+        const int topY = std::max(0, y - state.step);
+        const int bottomY = std::min(height_ - 1, y + state.step);
+        const float *top = state.ring.row(topY % state.ring.h);
+        const float *middle = state.ring.row(y % state.ring.h);
+        const float *bottom = state.ring.row(bottomY % state.ring.h);
+        float *target = level + 1 == levels_.size()
+            ? output_.row(y) : state.scratch.row(0);
+        int x = 0;
+#ifdef __AVX2__
+        const __m256 quarter = _mm256_set1_ps(0.25f);
+        const __m256 half = _mm256_set1_ps(0.5f);
+        for (; x + 8 <= width_; x += 8) {
+            const __m256 upper = _mm256_mul_ps(quarter, _mm256_loadu_ps(top + x));
+            const __m256 center = _mm256_mul_ps(half, _mm256_loadu_ps(middle + x));
+            const __m256 lower = _mm256_mul_ps(quarter, _mm256_loadu_ps(bottom + x));
+            _mm256_storeu_ps(target + x,
+                             _mm256_add_ps(_mm256_add_ps(upper, center), lower));
+        }
+#endif
+        for (; x < width_; ++x)
+            target[x] = 0.25f * top[x] + 0.5f * middle[x] + 0.25f * bottom[x];
+        if (level + 1 < levels_.size())
+            pushLevel(level + 1, y, target);
+    }
+
+    int width_ = 0;
+    int height_ = 0;
+    Plane &output_;
+    std::vector<Level> levels_;
+};
+
+struct DetailRowPipeline {
+    DetailRowPipeline(const Plane &source, double rw, double rh, Plane &output)
+        : y(source), xLevels(nyquistLevels(rw)), horizontal0(source.w, 1),
+          horizontal1(source.w, 1),
+          vertical(source.w, source.h, nyquistLevels(rh), output) {}
+
+    static void consume(void *opaque, int py, const float *reconstructed) {
+        static_cast<DetailRowPipeline *>(opaque)->consume(py, reconstructed);
+    }
+
+    void consume(int py, const float *reconstructed) {
+        float *detail = horizontal0.row(0);
+        const float *source = y.row(py);
+        int px = 0;
+#ifdef __AVX2__
+        for (; px + 8 <= y.w; px += 8)
+            _mm256_storeu_ps(detail + px, _mm256_sub_ps(
+                _mm256_loadu_ps(source + px),
+                _mm256_loadu_ps(reconstructed + px)));
+#endif
+        for (; px < y.w; ++px)
+            detail[px] = source[px] - reconstructed[px];
+
+        const auto nyquistStart = std::chrono::steady_clock::now();
+        for (int pass = 0; pass < xLevels; ++pass) {
+            const int step = 1 << pass;
+            const float *current = horizontal0.row(0);
+            float *next = horizontal1.row(0);
+            int x = 0;
+            for (; x < std::min(step, y.w); ++x)
+                next[x] = 0.25f * current[std::max(0, x - step)] +
+                          0.5f * current[x] +
+                          0.25f * current[std::min(y.w - 1, x + step)];
+#ifdef __AVX2__
+            const __m256 quarter = _mm256_set1_ps(0.25f);
+            const __m256 half = _mm256_set1_ps(0.5f);
+            for (; x + 8 <= y.w - step; x += 8) {
+                const __m256 left = _mm256_mul_ps(
+                    quarter, _mm256_loadu_ps(current + x - step));
+                const __m256 center = _mm256_mul_ps(
+                    half, _mm256_loadu_ps(current + x));
+                const __m256 right = _mm256_mul_ps(
+                    quarter, _mm256_loadu_ps(current + x + step));
+                _mm256_storeu_ps(next + x,
+                                 _mm256_add_ps(_mm256_add_ps(left, center), right));
+            }
+#endif
+            for (; x < y.w; ++x)
+                next[x] = 0.25f * current[std::max(0, x - step)] +
+                          0.5f * current[x] +
+                          0.25f * current[std::min(y.w - 1, x + step)];
+            horizontal0.swapOwnedStorage(horizontal1);
+        }
+        vertical.push(py, horizontal0.row(0));
+        nyquistNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - nyquistStart).count());
+    }
+
+    void finish() {
+        const auto start = std::chrono::steady_clock::now();
+        vertical.finish();
+        nyquistNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count());
+    }
+
+    const Plane &y;
+    int xLevels = 0;
+    Plane horizontal0;
+    Plane horizontal1;
+    VerticalNyquistPipeline vertical;
+    uint64_t nyquistNs = 0;
+};
+
+static Plane suppressSourceNyquist(Plane cur, double rw, double rh) {
+    const int xLevels = nyquistLevels(rw);
+    const int yLevels = nyquistLevels(rh);
     if (xLevels == 0 && yLevels == 0)
         return cur;
 
     Plane next(cur.w, cur.h);
     for (int pass = 0; pass < xLevels; ++pass) {
         const int step = 1 << pass;
-        for (int y = 0; y < cur.h; ++y)
-            for (int x = 0; x < cur.w; ++x)
+        for (int y = 0; y < cur.h; ++y) {
+            int x = 0;
+            for (; x < std::min(step, cur.w); ++x)
                 next.at(x, y) = 0.25f * cur.at(x - step, y) + 0.5f * cur.at(x, y)
                               + 0.25f * cur.at(x + step, y);
-        std::swap(cur.px, next.px);
+#ifdef __AVX2__
+            const __m256 quarter = _mm256_set1_ps(0.25f);
+            const __m256 half = _mm256_set1_ps(0.5f);
+            const float *source = cur.row(y);
+            float *target = next.row(y);
+            for (; x + 8 <= cur.w - step; x += 8) {
+                const __m256 left = _mm256_mul_ps(
+                    quarter, _mm256_loadu_ps(source + x - step));
+                const __m256 center = _mm256_mul_ps(
+                    half, _mm256_loadu_ps(source + x));
+                const __m256 right = _mm256_mul_ps(
+                    quarter, _mm256_loadu_ps(source + x + step));
+                _mm256_storeu_ps(target + x,
+                                 _mm256_add_ps(_mm256_add_ps(left, center), right));
+            }
+#endif
+            for (; x < cur.w; ++x)
+                next.at(x, y) = 0.25f * cur.at(x - step, y) + 0.5f * cur.at(x, y)
+                              + 0.25f * cur.at(x + step, y);
+        }
+        cur.swapOwnedStorage(next);
     }
     for (int pass = 0; pass < yLevels; ++pass) {
         const int step = 1 << pass;
-        for (int y = 0; y < cur.h; ++y)
-            for (int x = 0; x < cur.w; ++x)
-                next.at(x, y) = 0.25f * cur.at(x, y - step) + 0.5f * cur.at(x, y)
-                              + 0.25f * cur.at(x, y + step);
-        std::swap(cur.px, next.px);
+        for (int y = 0; y < cur.h; ++y) {
+            const float *top = cur.row(std::max(0, y - step));
+            const float *middle = cur.row(y);
+            const float *bottom = cur.row(std::min(cur.h - 1, y + step));
+            float *target = next.row(y);
+            int x = 0;
+#ifdef __AVX2__
+            const __m256 quarter = _mm256_set1_ps(0.25f);
+            const __m256 half = _mm256_set1_ps(0.5f);
+            for (; x + 8 <= cur.w; x += 8) {
+                const __m256 upper = _mm256_mul_ps(quarter, _mm256_loadu_ps(top + x));
+                const __m256 center = _mm256_mul_ps(half, _mm256_loadu_ps(middle + x));
+                const __m256 lower = _mm256_mul_ps(quarter, _mm256_loadu_ps(bottom + x));
+                _mm256_storeu_ps(target + x,
+                                 _mm256_add_ps(_mm256_add_ps(upper, center), lower));
+            }
+#endif
+            for (; x < cur.w; ++x)
+                target[x] = 0.25f * top[x] + 0.5f * middle[x] + 0.25f * bottom[x];
+        }
+        cur.swapOwnedStorage(next);
     }
     return cur;
 }
@@ -891,22 +1381,55 @@ static Plane resampleDetailToOutput(Plane src, const LGCRData &d) {
 
 AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
                            const Plane &cr, int cw, int ch, double rw, double rh,
-                           PipelineMetrics *metrics) {
+                           PipelineMetrics *metrics, const GuideMaps *guideMaps,
+                           const SparseWorkset *workset,
+                           FrameScratchAllocator *scratch) {
     AffineMaps m;
-    m.aU = Plane(cw, ch);
-    m.aV = Plane(cw, ch);
-    m.g = Plane(cw, ch);
-    m.mnU = Plane(cw, ch);
-    m.mxU = Plane(cw, ch);
-    m.mnV = Plane(cw, ch);
-    m.mxV = Plane(cw, ch);
-    m.rng = Plane(cw, ch);
+    m.aU = scratchPlane(scratch, cw, ch);
+    m.aV = scratchPlane(scratch, cw, ch);
+    m.g = scratchPlane(scratch, cw, ch);
+    m.mnU = scratchPlane(scratch, cw, ch);
+    m.mxU = scratchPlane(scratch, cw, ch);
+    m.mnV = scratchPlane(scratch, cw, ch);
+    m.mxV = scratchPlane(scratch, cw, ch);
+    m.rng = scratchPlane(scratch, cw, ch);
 
     const double eps = d->reg * d->reg;
     const double epsSig = (0.25 * d->sigma) * (0.25 * d->sigma);
-    // Candidate encoder degradations (unknown D: accept only stable conclusions)
-    const std::array<Plane, 3> yc = buildYcMaps(
-        d, y, cw, ch, rw, rh, d->shiftX, d->shiftY, metrics);
+    // Candidate encoder degradations (unknown D: accept only stable conclusions).
+    // buildGuideMaps already produced the exact box candidate for this geometry.
+    std::array<Plane, 3> ownedCandidates;
+    std::array<Plane, 2> filteredCandidates;
+    std::array<const Plane *, 3> yc{};
+    if (guideMaps && guideMaps->lc.w == cw && guideMaps->lc.h == ch) {
+        filteredCandidates = buildYcFilteredMaps(
+            d, y, cw, ch, rw, rh, d->shiftX, d->shiftY, metrics, scratch);
+        yc = {{&guideMaps->lc, &filteredCandidates[0], &filteredCandidates[1]}};
+    } else {
+        ownedCandidates = buildYcMaps(
+            d, y, cw, ch, rw, rh, d->shiftX, d->shiftY, metrics);
+        yc = {{&ownedCandidates[0], &ownedCandidates[1], &ownedCandidates[2]}};
+    }
+    m.degradedLuma = scratchPlane(scratch, cw, ch);
+    const bool sparseRoi = workset && workset->chromaWidth == cw &&
+        workset->chromaHeight == ch && !workset->chromaDenseFallback();
+    if (sparseRoi) {
+        for (Plane *plane : {&m.aU, &m.aV, &m.g, &m.mnU, &m.mxU,
+                             &m.mnV, &m.mxV, &m.rng})
+            plane->fill(0.0f);
+        {
+            ScopedCpuTimer timer(metrics, CpuProfileSlot::AffineFinalizeMedian);
+            for (int cy = 0; cy < ch; ++cy)
+                for (int cx = 0; cx < cw; ++cx)
+                    m.degradedLuma.row(cy)[cx] = median3(
+                        yc[0]->row(cy)[cx], yc[1]->row(cy)[cx], yc[2]->row(cy)[cx]);
+        }
+        {
+            ScopedCpuTimer timer(metrics, CpuProfileSlot::AffineWindowMoments);
+            affineSparseFixed5(cb, cr, yc, eps, epsSig, *workset, m, metrics);
+        }
+        return m;
+    }
     const int r = 2;
 #ifdef __AVX2__
     {
@@ -930,8 +1453,6 @@ AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
         slidingMinMax(cr, r, m.mnV, m.mxV);
     }
 #endif
-    m.degradedLuma = Plane(cw, ch);
-
     // U/V moments and all three degradation candidates share one rolling
     // window traversal. Working storage is O(width), not O(frame size).
     bool specialized = false;
@@ -950,7 +1471,7 @@ AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
             values[0] = u; values[1] = u * u;
             values[2] = v; values[3] = v * v;
             for (int k = 0; k < 3; ++k) {
-                const double ly = yc[k].row(py)[x];
+                const double ly = yc[k]->row(py)[x];
                 const int base = 4 + 4 * k;
                 values[base] = ly;
                 values[base + 1] = ly * ly;
@@ -999,13 +1520,37 @@ AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
         for (int cy = 0; cy < ch; ++cy)
             for (int cx = 0; cx < cw; ++cx)
                 m.degradedLuma.row(cy)[cx] = median3(
-                    yc[0].row(cy)[cx], yc[1].row(cy)[cx], yc[2].row(cy)[cx]);
+                    yc[0]->row(cy)[cx], yc[1]->row(cy)[cx], yc[2]->row(cy)[cx]);
     }
     return m;
 }
 
 void buildDetailMap(const LGCRData *d, const Plane &y, int cw, int ch,
-                    double rw, double rh, AffineMaps &m) {
+                    double rw, double rh, AffineMaps &m,
+                    PipelineMetrics *metrics) {
+    if (!d->radial && d->outW == y.w && d->outH == y.h) {
+        const auto start = std::chrono::steady_clock::now();
+        m.detail = Plane(y.w, y.h);
+        DetailRowPipeline pipeline(y, rw, rh, m.detail);
+        LGCRData sourceD = *d;
+        sourceD.outW = y.w;
+        sourceD.outH = y.h;
+        plainPlaneRows(&sourceD, m.degradedLuma, y.w, y.h, cw, ch,
+                       DetailRowPipeline::consume, &pipeline);
+        m.degradedLuma.clear();
+        pipeline.finish();
+        if (metrics) {
+            const uint64_t totalNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start).count());
+            metrics->add(CpuProfileSlot::DetailNyquist, pipeline.nyquistNs);
+            metrics->add(CpuProfileSlot::DetailReconstruct,
+                         totalNs > pipeline.nyquistNs
+                             ? totalNs - pipeline.nyquistNs : 0);
+        }
+        return;
+    }
+
     // Reconstruct matched luma to the SOURCE luma grid first. The unobservable
     // frequency locations are defined on this grid and must not move when the
     // user requests a different output size.
@@ -1013,20 +1558,39 @@ void buildDetailMap(const LGCRData *d, const Plane &y, int cw, int ch,
     sourceD.outW = y.w;
     sourceD.outH = y.h;
     Plane sourceDetail(y.w, y.h);
-    plainPlane(&sourceD, m.degradedLuma, y.w, y.h, cw, ch, sourceDetail);
-    for (int py = 0; py < y.h; ++py)
-        for (int px = 0; px < y.w; ++px)
-            sourceDetail.at(px, py) = y.at(px, py) - sourceDetail.at(px, py);
-    sourceDetail = suppressSourceNyquist(std::move(sourceDetail), rw, rh);
-    m.detail = resampleDetailToOutput(std::move(sourceDetail), *d);
-    m.degradedLuma = Plane();
+    {
+        ScopedCpuTimer timer(metrics, CpuProfileSlot::DetailReconstruct);
+        plainPlane(&sourceD, m.degradedLuma, y.w, y.h, cw, ch, sourceDetail);
+        for (int py = 0; py < y.h; ++py) {
+            int px = 0;
+#ifdef __AVX2__
+            for (; px + 8 <= y.w; px += 8)
+                _mm256_storeu_ps(sourceDetail.row(py) + px, _mm256_sub_ps(
+                    _mm256_loadu_ps(y.row(py) + px),
+                    _mm256_loadu_ps(sourceDetail.row(py) + px)));
+#endif
+            for (; px < y.w; ++px)
+                sourceDetail.row(py)[px] = y.row(py)[px] - sourceDetail.row(py)[px];
+        }
+    }
+    {
+        ScopedCpuTimer timer(metrics, CpuProfileSlot::DetailNyquist);
+        sourceDetail = suppressSourceNyquist(std::move(sourceDetail), rw, rh);
+    }
+    {
+        ScopedCpuTimer timer(metrics, CpuProfileSlot::DetailReconstruct);
+        m.detail = resampleDetailToOutput(std::move(sourceDetail), *d);
+    }
+    m.degradedLuma.clear();
 }
 
 template <class Backend>
 void detailTransferImpl(const LGCRData *d, Plane &outU, Plane &outV,
                         const AffineMaps &af, const GuideMaps &gm,
                         const ChromaAxis &ax, const ChromaAxis &ay,
-                        const uint8_t *mask, int maskW, int maskH) {
+                        const uint8_t *mask, int maskW, int maskH,
+                        const SparseWorkset *workset, PipelineMetrics *metrics) {
+    ScopedCpuTimer profileTimer(metrics, CpuProfileSlot::DetailTransfer);
     [[maybe_unused]] constexpr int lanes = Backend::lanes;
     const int ow = outU.w, oh = outU.h;
     const Plane &dl = af.detail;
@@ -1041,9 +1605,11 @@ void detailTransferImpl(const LGCRData *d, Plane &outU, Plane &outV,
     const float ar = float(std::max(0.0, d->arMargin));
     const bool clampHull = d->arMargin >= 0.0;
 
+    const bool sharedWorkset = workset && workset->outputWidth == ow &&
+        workset->outputHeight == oh;
     const bool directMask = mask && maskW == ow && maskH == oh;
     std::vector<int> maskX;
-    if (mask && !directMask) {
+    if (mask && !directMask && !sharedWorkset) {
         maskX.resize(ow);
         for (int ox = 0; ox < ow; ++ox)
             maskX[ox] = std::min(maskW - 1, int(int64_t(ox) * maskW / ow));
@@ -1055,14 +1621,14 @@ void detailTransferImpl(const LGCRData *d, Plane &outU, Plane &outV,
         const int cyi = bcy.i0[oy], lyi = bly.i0[oy];
         const float cyf = bcy.f[oy], lyf = bly.f[oy];
         const uint8_t *maskRow = nullptr;
-        if (mask) {
+        if (mask && !sharedWorkset) {
             const int my = directMask ? oy
                 : std::min(maskH - 1, int(int64_t(oy) * maskH / oh));
             maskRow = mask + size_t(my) * maskW;
         }
-        for (int ox = 0; ox < ow; ++ox) {
+        auto processPixel = [&](int ox) {
             if (maskRow && maskRow[directMask ? ox : maskX[ox]] == 0)
-                continue;
+                return;
             const float jxx = bilinearFast(
                 gm.jxx, blx.i0[ox], blx.f[ox], lyi, lyf);
             const float jxy = bilinearFast(
@@ -1107,6 +1673,17 @@ void detailTransferImpl(const LGCRData *d, Plane &outU, Plane &outV,
             }
             ru[ox] = ou;
             rv[ox] = ov;
+        };
+        if (sharedWorkset) {
+            for (size_t spanIndex = workset->outputRowOffsets[oy];
+                 spanIndex < workset->outputRowOffsets[oy + 1]; ++spanIndex) {
+                const SparseSpan span = workset->outputSpans[spanIndex];
+                for (int ox = span.begin; ox < span.end; ++ox)
+                    processPixel(ox);
+            }
+        } else {
+            for (int ox = 0; ox < ow; ++ox)
+                processPixel(ox);
         }
     }
 }
@@ -1114,9 +1691,10 @@ void detailTransferImpl(const LGCRData *d, Plane &outU, Plane &outV,
 void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
                     const AffineMaps &af, const GuideMaps &gm,
                     const ChromaAxis &ax, const ChromaAxis &ay,
-                    const uint8_t *mask, int maskW, int maskH) {
+                    const uint8_t *mask, int maskW, int maskH,
+                    const SparseWorkset *workset, PipelineMetrics *metrics) {
     detailTransferImpl<NativeBackend>(d, outU, outV, af, gm, ax, ay,
-                                      mask, maskW, maskH);
+                                      mask, maskW, maskH, workset, metrics);
 }
 
 } // namespace lgcr

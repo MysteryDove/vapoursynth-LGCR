@@ -154,34 +154,6 @@ static void writeProfile(VSFrame *frame, const PipelineMetrics &metrics,
     vsapi->mapSetFloat(props, "_LGCR_sparse_active_ratio", active, maReplace);
 }
 
-static std::vector<uint8_t> projectTrustMaskToChroma(
-    const std::vector<uint8_t> &mask, int maskW, int maskH,
-    int outW, int outH, const ChromaAxis &ax, const ChromaAxis &ay,
-    int chromaW, int chromaH) {
-    std::vector<uint8_t> active(size_t(chromaW) * chromaH, 0);
-    std::vector<int> maskX(outW);
-    for (int ox = 0; ox < outW; ++ox)
-        maskX[ox] = std::min(maskW - 1, int(int64_t(ox) * maskW / outW));
-
-    for (int oy = 0; oy < outH; ++oy) {
-        const int my = std::min(maskH - 1, int(int64_t(oy) * maskH / outH));
-        const uint8_t *maskRow = mask.data() + size_t(my) * maskW;
-        const int cy0 = ay.chromaBilin.i0[oy];
-        const int cy1 = std::min(cy0 + 1, chromaH - 1);
-        uint8_t *active0 = active.data() + size_t(cy0) * chromaW;
-        uint8_t *active1 = active.data() + size_t(cy1) * chromaW;
-        for (int ox = 0; ox < outW; ++ox) {
-            if (maskRow[maskX[ox]] == 0)
-                continue;
-            const int cx0 = ax.chromaBilin.i0[ox];
-            const int cx1 = std::min(cx0 + 1, chromaW - 1);
-            active0[cx0] = active0[cx1] = 1;
-            active1[cx0] = active1[cx1] = 1;
-        }
-    }
-    return active;
-}
-
 static void applyFrameChromaSiting(LGCRData &d, const VSVideoFormat *fmt,
                                    const VSFrame *frame, const VSAPI *vsapi) {
     if (fmt->subSamplingW == 0)
@@ -240,93 +212,133 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     const double yScale = isFloat ? 1.0 : 1.0 / double((1 << fmt->bitsPerSample) - 1);
     const double cOffset = isFloat ? 0.0 : -0.5; // int chroma: 0.5 neutral -> 0
 
-    Plane y(sw, sh), cb(cw, ch), cr(cw, ch);
+    VSCoreInfo coreInfo{};
+    vsapi->getCoreInfo(core, &coreInfo);
+    FrameWorkspaceLease workspaceLease = d->workspacePool->acquire(coreInfo.numThreads);
+    FrameWorkspace &workspace = workspaceLease.get();
+    Plane sourceYView, sourceUView, sourceVView;
+    Plane *sourceY = &workspace.sourceY;
+    Plane *sourceU = &workspace.sourceU;
+    Plane *sourceV = &workspace.sourceV;
     {
         ScopedStageTimer timer(metrics, Stage::ConvertInput);
         if (isFloat) {
-            planeToFloat<float>(vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0), y, sw, sh, 1.0, 0.0);
-            planeToFloat<float>(vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1), cb, cw, ch, 1.0, 0.0);
-            planeToFloat<float>(vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2), cr, cw, ch, 1.0, 0.0);
+            sourceYView = Plane::readOnlyView(
+                reinterpret_cast<const float *>(vsapi->getReadPtr(src, 0)),
+                sw, sh, int(vsapi->getStride(src, 0) / sizeof(float)));
+            sourceUView = Plane::readOnlyView(
+                reinterpret_cast<const float *>(vsapi->getReadPtr(src, 1)),
+                cw, ch, int(vsapi->getStride(src, 1) / sizeof(float)));
+            sourceVView = Plane::readOnlyView(
+                reinterpret_cast<const float *>(vsapi->getReadPtr(src, 2)),
+                cw, ch, int(vsapi->getStride(src, 2) / sizeof(float)));
+            sourceY = &sourceYView;
+            sourceU = &sourceUView;
+            sourceV = &sourceVView;
         } else if (fmt->bytesPerSample == 1) {
-            planeToFloat<uint8_t>(vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0), y, sw, sh, yScale, 0.0);
-            planeToFloat<uint8_t>(vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1), cb, cw, ch, yScale, cOffset);
-            planeToFloat<uint8_t>(vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2), cr, cw, ch, yScale, cOffset);
+            workspace.sourceY.resizeDiscard(sw, sh);
+            workspace.sourceU.resizeDiscard(cw, ch);
+            workspace.sourceV.resizeDiscard(cw, ch);
+            planeToFloat<uint8_t>(vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0), *sourceY, sw, sh, yScale, 0.0);
+            planeToFloat<uint8_t>(vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1), *sourceU, cw, ch, yScale, cOffset);
+            planeToFloat<uint8_t>(vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2), *sourceV, cw, ch, yScale, cOffset);
         } else {
-            planeToFloat<uint16_t>(vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0), y, sw, sh, yScale, 0.0);
-            planeToFloat<uint16_t>(vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1), cb, cw, ch, yScale, cOffset);
-            planeToFloat<uint16_t>(vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2), cr, cw, ch, yScale, cOffset);
+            workspace.sourceY.resizeDiscard(sw, sh);
+            workspace.sourceU.resizeDiscard(cw, ch);
+            workspace.sourceV.resizeDiscard(cw, ch);
+            planeToFloat<uint16_t>(vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0), *sourceY, sw, sh, yScale, 0.0);
+            planeToFloat<uint16_t>(vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1), *sourceU, cw, ch, yScale, cOffset);
+            planeToFloat<uint16_t>(vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2), *sourceV, cw, ch, yScale, cOffset);
         }
     }
-    if (metrics)
+    if (metrics && !isFloat)
         metrics->addWork(Stage::ConvertInput,
                          uint64_t(sw) * sh + 2 * uint64_t(cw) * ch);
+    Plane &y = *sourceY;
+    Plane &cb = *sourceU;
+    Plane &cr = *sourceV;
 
     const double rw = double(sw) / cw;
     const double rh = double(sh) / ch;
 
     // Output frame
-    VSFrame *dst = vsapi->newVideoFrame(&d->viOut.format, d->outW, d->outH, src, core);
+    const bool sameSize = d->outW == sw && d->outH == sh;
+    const VSFrame *planeSources[3] = { sameSize ? src : nullptr, nullptr, nullptr };
+    const int sourcePlanes[3] = { 0, 0, 0 };
+    VSFrame *dst = vsapi->newVideoFrame2(
+        &d->viOut.format, d->outW, d->outH, planeSources, sourcePlanes, src, core);
     // output is 4:4:4: the chroma siting prop no longer applies
     vsapi->mapDeleteKey(vsapi->getFramePropertiesRW(dst), "_ChromaLocation");
 
     // Luma: same size -> verbatim copy (a same-size jinc pass would LOW-PASS:
     // jinc(1)=0.18 != 0); scaled -> separable kernel or true 2D radial.
     {
-        Plane yOut;
-        const Plane *outputY = &y;
+        Plane outputYView;
+        Plane *outputY = nullptr;
         {
             ScopedStageTimer timer(metrics, Stage::ResampleLuma);
-            if (d->outW != sw || d->outH != sh) {
-                yOut = Plane(d->outW, d->outH);
-                outputY = &yOut;
+            if (!sameSize && isFloat) {
+                outputYView = Plane::writableView(
+                    reinterpret_cast<float *>(vsapi->getWritePtr(dst, 0)),
+                    d->outW, d->outH,
+                    int(vsapi->getStride(dst, 0) / sizeof(float)));
+                outputY = &outputYView;
+            } else if (!sameSize) {
+                workspace.fullSlot0.resizeDiscard(d->outW, d->outH);
+                outputY = &workspace.fullSlot0;
             }
-            if (outputY != &y && d->radial) {
-                resampleRadial(y, yOut, *d);
-            } else if (outputY != &y) {
+            if (outputY && d->radial) {
+                resampleRadial(y, *outputY, *d);
+            } else if (outputY) {
                 const auto th = cachedWeights(d, sw, d->outW, 0.0);
                 const auto tv = cachedWeights(d, sh, d->outH, 0.0);
-                Plane tmp(d->outW, sh);
-                resampleH(y, tmp, *th);
-                resampleV(tmp, yOut, *tv);
+                workspace.fullSlot1.resizeDiscard(d->outW, sh);
+                resampleH(y, workspace.fullSlot1, *th);
+                resampleV(workspace.fullSlot1, *outputY, *tv);
             }
         }
-        if (metrics)
+        if (metrics && !sameSize)
             metrics->addWork(Stage::ResampleLuma, uint64_t(d->outW) * d->outH);
 
-        {
+        if (outputY && !isFloat) {
             ScopedStageTimer timer(metrics, Stage::ConvertOutput);
-            if (isFloat)
-                floatToPlane<float>(*outputY, vsapi->getWritePtr(dst, 0), vsapi->getStride(dst, 0),
-                                    d->outW, d->outH, 1.0, 0.0, -1e30f, 1e30f);
-            else if (fmt->bytesPerSample == 1)
+            if (fmt->bytesPerSample == 1)
                 floatToPlane<uint8_t>(*outputY, vsapi->getWritePtr(dst, 0), vsapi->getStride(dst, 0),
                                       d->outW, d->outH, double((1 << fmt->bitsPerSample) - 1), 0.0, 0, 255);
             else
                 floatToPlane<uint16_t>(*outputY, vsapi->getWritePtr(dst, 0), vsapi->getStride(dst, 0),
                                        d->outW, d->outH, double((1 << fmt->bitsPerSample) - 1), 0.0,
                                        0, uint16_t((1 << fmt->bitsPerSample) - 1));
+            if (metrics)
+                metrics->addWork(Stage::ConvertOutput,
+                                 uint64_t(d->outW) * d->outH);
         }
     }
 
     // Guide maps from the SOURCE luma (see recon.cpp for why output-space
     // was tried and rejected); Lc footprint also from the source plane.
     GuideMaps gm;
-    std::vector<uint8_t> trustMask;
+    SparseWorkset sparseWorkset;
+    bool hasSparseWorkset = false;
+    std::shared_ptr<const ChromaAxis> frameAxisX, frameAxisY;
     if (d->strength > 0.0) {
+        const double trustThreshold = d->algo == 4 ? 0.25 * d->sigma : d->sigma;
         {
             ScopedStageTimer timer(metrics, Stage::BuildGuideMaps);
             gm = buildGuideMaps(y, y, cw, ch, rw, rh, d->shiftX, d->shiftY,
-                                metrics);
+                                metrics, d->sparse ? trustThreshold : -1.0,
+                                &workspace.scratch);
         }
         if (metrics)
             metrics->addWork(Stage::BuildGuideMaps,
                              uint64_t(sw) * sh + uint64_t(cw) * ch);
         if (d->sparse) {
             const int dil = int(std::ceil(d->support * std::max(rw, rh))) + 8;
-            const double threshold = d->algo == 4 ? 0.25 * d->sigma : d->sigma;
+            std::vector<uint8_t> trustMask;
             {
                 ScopedStageTimer timer(metrics, Stage::BuildTrustMask);
-                trustMask = buildTrustMask(gm, sw, sh, threshold, dil);
+                trustMask = buildTrustMask(
+                    gm, sw, sh, trustThreshold, dil, metrics);
             }
             if (metrics) {
                 metrics->addWork(Stage::BuildTrustMask, uint64_t(sw) * sh);
@@ -334,21 +346,22 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
                 metrics->sparseActivePixels += static_cast<uint64_t>(
                     std::count(trustMask.begin(), trustMask.end(), uint8_t{1}));
             }
+            frameAxisX = cachedChromaAxis(d, sw, d->outW, rw, d->shiftX);
+            frameAxisY = cachedChromaAxis(d, sh, d->outH, rh, d->shiftY);
+            sparseWorkset = buildSparseWorkset(
+                std::move(trustMask), sw, sh, d->outW, d->outH,
+                *frameAxisX, *frameAxisY, cw, ch);
+            hasSparseWorkset = true;
         }
         uint64_t mutualPixels = uint64_t(cw) * ch;
         if (d->ms > 0.0) {
             ScopedStageTimer timer(metrics, Stage::BuildMutualGate);
-            std::vector<uint8_t> mutualMask;
-            if (!trustMask.empty()) {
-                const auto ax = cachedChromaAxis(d, sw, d->outW, rw, d->shiftX);
-                const auto ay = cachedChromaAxis(d, sh, d->outH, rh, d->shiftY);
-                mutualMask = projectTrustMaskToChroma(
-                    trustMask, sw, sh, d->outW, d->outH, *ax, *ay, cw, ch);
-                mutualPixels = static_cast<uint64_t>(
-                    std::count(mutualMask.begin(), mutualMask.end(), uint8_t{1}));
-            }
+            if (hasSparseWorkset)
+                mutualPixels = sparseWorkset.activeChromaPixels;
             gm.ms = buildMutualGate(gm.lc, cb, cr, d->sigma,
-                                    mutualMask.empty() ? nullptr : mutualMask.data(), cw);
+                                    hasSparseWorkset ? sparseWorkset.chromaMask.data() : nullptr,
+                                    cw, hasSparseWorkset ? &sparseWorkset : nullptr,
+                                    metrics, &workspace.scratch);
         }
         if (metrics && d->ms > 0.0)
             metrics->addWork(Stage::BuildMutualGate, mutualPixels,
@@ -358,55 +371,204 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     // Chroma: guided reconstruction (output 444 grid == output luma grid).
     // Both planes are processed in one pass — guide weights depend only on
     // luma and geometry, so U and V share them.
-    Plane cOutU(d->outW, d->outH), cOutV(d->outW, d->outH);
+    const bool needsBackProjection = d->bp > 0.0 && d->outW == sw &&
+        d->outH == sh && cw * 2 == sw && ch * 2 == sh;
+    Plane outputUView, outputVView;
+    Plane *outputU = &workspace.fullSlot0;
+    Plane *outputV = &workspace.fullSlot1;
+    if (isFloat && !d->bm) {
+        outputUView = Plane::writableView(
+            reinterpret_cast<float *>(vsapi->getWritePtr(dst, 1)),
+            d->outW, d->outH,
+            int(vsapi->getStride(dst, 1) / sizeof(float)));
+        outputVView = Plane::writableView(
+            reinterpret_cast<float *>(vsapi->getWritePtr(dst, 2)),
+            d->outW, d->outH,
+            int(vsapi->getStride(dst, 2) / sizeof(float)));
+        outputU = &outputUView;
+        outputV = &outputVView;
+    } else {
+        workspace.fullSlot0.resizeDiscard(d->outW, d->outH);
+        workspace.fullSlot1.resizeDiscard(d->outW, d->outH);
+    }
+    Plane &cOutU = *outputU;
+    Plane &cOutV = *outputV;
     if (d->algo == 4) {
-        // Selector: plain base + per-pixel routing between the sim path
-        // (axis-aligned hard edges) and the LGF path (diagonal hard edges)
+        // Selector: plain base + guided metadata pass. LGF is intentionally
+        // delayed until w3 has identified a diagonal-edge ROI.
         {
             ScopedStageTimer timer(metrics, Stage::BuildBaseChroma);
             plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV, metrics);
         }
         if (d->strength > 0.0) {
-            LGFMaps lgf;
-            {
-                ScopedStageTimer timer(metrics, Stage::BuildLGF);
-                lgf = buildLGFMaps(d, y, cb, cr, cw, ch, rw, rh);
-            }
-            if (metrics)
-                metrics->addWork(Stage::BuildLGF, uint64_t(cw) * ch);
-            if (gm.ms.w > 0) // co-edge gate applies to the LGF branch too
-                for (int j = 0; j < ch; ++j)
-                    for (int i = 0; i < cw; ++i) {
-                        const float f = 1.0f - float(d->ms) * (1.0f - gm.ms.at(i, j));
-                        lgf.confU.at(i, j) *= f;
-                        lgf.confV.at(i, j) *= f;
-                    }
+            if (!isFloat) {
+                // Keep the original single-expression selector for integer
+                // output. Materializing the guided pass in a float plane can
+                // move an otherwise equivalent value across a 16-bit rounding
+                // boundary, which violates Recon's numerical contract.
+                LGFMaps lgf;
+                {
+                    ScopedStageTimer timer(metrics, Stage::BuildLGF);
+                    lgf = buildLGFMaps(
+                        d, y, cb, cr, cw, ch, rw, rh, metrics,
+                        nullptr, 0, &workspace.scratch);
+                }
+                if (metrics)
+                    metrics->addWork(Stage::BuildLGF, uint64_t(cw) * ch);
+                if (gm.ms.w > 0)
+                    for (int j = 0; j < ch; ++j)
+                        for (int i = 0; i < cw; ++i) {
+                            const float f = 1.0f - float(d->ms) *
+                                (1.0f - gm.ms.at(i, j));
+                            lgf.confU.at(i, j) *= f;
+                            lgf.confV.at(i, j) *= f;
+                        }
 
-            LGCRData d4 = *d;
-            d4.algo = 2;
-            d4.strength = 1.0; // fades still apply; lam applied once in blend
-            ChromaJob job;
-            job.srcU = &cb; job.srcV = &cr; job.srcY = &y; job.gm = &gm;
-            job.dstU = &cOutU; job.dstV = &cOutV;
-            job.srcLumaW = sw; job.srcLumaH = sh;
-            job.rw = rw; job.rh = rh; job.shiftX = d->shiftX; job.shiftY = d->shiftY;
-            job.d = &d4;
-            job.selectorMaps = &lgf;
-            job.selectorStrength = float(d->strength);
-            job.plainU = &cOutU;
-            job.plainV = &cOutV;
-            job.metrics = metrics;
-            if (!trustMask.empty()) {
-                job.mask = trustMask.data();
-                job.maskW = sw;
-                job.maskH = sh;
+                LGCRData integerSelector = *d;
+                integerSelector.algo = 2;
+                integerSelector.strength = 1.0;
+                ChromaJob job;
+                job.srcU = &cb; job.srcV = &cr; job.srcY = &y; job.gm = &gm;
+                job.dstU = &cOutU; job.dstV = &cOutV;
+                job.srcLumaW = sw; job.srcLumaH = sh;
+                job.rw = rw; job.rh = rh;
+                job.shiftX = d->shiftX; job.shiftY = d->shiftY;
+                job.d = &integerSelector;
+                job.selectorMaps = &lgf;
+                job.selectorStrength = float(d->strength);
+                job.plainU = &cOutU;
+                job.plainV = &cOutV;
+                job.metrics = metrics;
+                if (hasSparseWorkset)
+                    job.workset = &sparseWorkset;
+                {
+                    ScopedStageTimer timer(metrics, Stage::ApplyGuidedCorrection);
+                    reconstructChroma(job);
+                }
+                if (metrics)
+                    metrics->addWork(Stage::ApplySelector,
+                                     uint64_t(d->outW) * d->outH);
+            } else {
+                LGCRData d4 = *d;
+                d4.algo = 2;
+                d4.strength = 1.0; // fades still apply; lam applied once in blend
+                const bool compressedSelector = hasSparseWorkset &&
+                    !sparseWorkset.outputDenseFallback();
+                Plane guidedU, guidedV, w2, w3;
+                CompressedSelector selector;
+                if (compressedSelector)
+                    selector.resize(sparseWorkset.activeOutputPixels);
+                else {
+                    guidedU = Plane(d->outW, d->outH);
+                    guidedV = Plane(d->outW, d->outH);
+                    w2 = Plane(d->outW, d->outH);
+                    w3 = Plane(d->outW, d->outH);
+                }
+                ChromaJob job;
+                job.srcU = &cb; job.srcV = &cr; job.srcY = &y; job.gm = &gm;
+                job.dstU = compressedSelector ? &cOutU : &guidedU;
+                job.dstV = compressedSelector ? &cOutV : &guidedV;
+                job.srcLumaW = sw; job.srcLumaH = sh;
+                job.rw = rw; job.rh = rh; job.shiftX = d->shiftX; job.shiftY = d->shiftY;
+                job.d = &d4;
+                job.selectorStrength = float(d->strength);
+                job.selectorMetadata = true;
+                if (compressedSelector) {
+                    job.compressedSelector = &selector;
+                    job.plainU = &cOutU;
+                    job.plainV = &cOutV;
+                } else {
+                    job.selectorW2 = &w2;
+                    job.selectorW3 = &w3;
+                }
+                job.metrics = metrics;
+                if (hasSparseWorkset)
+                    job.workset = &sparseWorkset;
+                {
+                    ScopedStageTimer timer(metrics, Stage::ApplyGuidedCorrection);
+                    reconstructChroma(job);
+                }
+
+                const auto ax = frameAxisX ? frameAxisX
+                    : cachedChromaAxis(d, sw, d->outW, rw, d->shiftX);
+                const auto ay = frameAxisY ? frameAxisY
+                    : cachedChromaAxis(d, sh, d->outH, rh, d->shiftY);
+                std::vector<uint8_t> roi(size_t(cw) * ch, 0);
+                auto markRoi = [&](int ox, int oy, float selectorW3) {
+                    if (selectorW3 < 1e-4f)
+                        return;
+                    const int cx0 = ax->chromaBilin.i0[ox];
+                    const int cx1 = std::min(cx0 + 1, cw - 1);
+                    const int cy0 = ay->chromaBilin.i0[oy];
+                    const int cy1 = std::min(cy0 + 1, ch - 1);
+                    roi[size_t(cy0) * cw + cx0] = 1;
+                    roi[size_t(cy0) * cw + cx1] = 1;
+                    roi[size_t(cy1) * cw + cx0] = 1;
+                    roi[size_t(cy1) * cw + cx1] = 1;
+                };
+                if (compressedSelector) {
+                    for (int oy = 0; oy < d->outH; ++oy) {
+                        size_t index = sparseWorkset.outputIndexRowOffsets[oy];
+                        for (size_t spanIndex = sparseWorkset.outputRowOffsets[oy];
+                             spanIndex < sparseWorkset.outputRowOffsets[oy + 1]; ++spanIndex) {
+                            const SparseSpan span = sparseWorkset.outputSpans[spanIndex];
+                            for (int ox = span.begin; ox < span.end; ++ox, ++index)
+                                markRoi(ox, oy, selector.w3[index]);
+                        }
+                    }
+                } else if (hasSparseWorkset) {
+                    for (int oy = 0; oy < d->outH; ++oy)
+                        for (size_t spanIndex = sparseWorkset.outputRowOffsets[oy];
+                             spanIndex < sparseWorkset.outputRowOffsets[oy + 1]; ++spanIndex) {
+                            const SparseSpan span = sparseWorkset.outputSpans[spanIndex];
+                            for (int ox = span.begin; ox < span.end; ++ox)
+                                markRoi(ox, oy, w3.row(oy)[ox]);
+                        }
+                } else {
+                    for (int oy = 0; oy < d->outH; ++oy)
+                        for (int ox = 0; ox < d->outW; ++ox)
+                            markRoi(ox, oy, w3.row(oy)[ox]);
+                }
+                LGFMaps lgf;
+                {
+                    ScopedStageTimer timer(metrics, Stage::BuildLGF);
+                    lgf = buildLGFMaps(d, y, cb, cr, cw, ch, rw, rh, metrics,
+                                       roi.data(), cw, &workspace.scratch);
+                }
+                if (metrics)
+                    metrics->addWork(Stage::BuildLGF, uint64_t(std::count(
+                        roi.begin(), roi.end(), uint8_t{1})));
+                {
+                    ScopedCpuTimer timer(metrics, CpuProfileSlot::LGFFinalize);
+                    if (gm.ms.w > 0)
+                        for (int j = 0; j < ch; ++j)
+                            for (int i = 0; i < cw; ++i) {
+                                if (roi[size_t(j) * cw + i] == 0)
+                                    continue;
+                                const float f = 1.0f - float(d->ms) * (1.0f - gm.ms.at(i, j));
+                                lgf.confU.at(i, j) *= f;
+                                lgf.confV.at(i, j) *= f;
+                            }
+                }
+                {
+                    ScopedStageTimer timer(metrics, Stage::ApplySelector);
+                    if (compressedSelector)
+                        blendSelectorCompressed(
+                            cOutU, cOutV, selector, lgf.aU, lgf.bU, lgf.aV, lgf.bV,
+                            lgf.confU, lgf.confV, y, *ax, *ay, sparseWorkset,
+                            float(d->strength), metrics);
+                    else
+                        blendSelector(cOutU, cOutV, guidedU, guidedV,
+                                      lgf.aU, lgf.bU, lgf.aV, lgf.bV,
+                                      lgf.confU, lgf.confV, y, *ax, *ay, w2, w3,
+                                      cw, ch, float(d->strength),
+                                      hasSparseWorkset ? &sparseWorkset : nullptr, metrics);
+                }
+                if (metrics)
+                    metrics->addWork(Stage::ApplySelector, compressedSelector
+                        ? sparseWorkset.activeOutputPixels
+                        : uint64_t(d->outW) * d->outH);
             }
-            {
-                ScopedStageTimer timer(metrics, Stage::ApplyGuidedCorrection);
-                reconstructChroma(job);
-            }
-            if (metrics)
-                metrics->addWork(Stage::ApplySelector, uint64_t(d->outW) * d->outH);
         }
     } else if (d->algo == 6) {
         // Constrained detail transfer: plain kernel base + g*a*(Y - P(D(Y))).
@@ -420,28 +582,43 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
             AffineMaps af;
             {
                 ScopedStageTimer timer(metrics, Stage::BuildAffineMaps);
-                af = buildAffineMaps(d, y, cb, cr, cw, ch, rw, rh, metrics);
+                af = buildAffineMaps(
+                    d, y, cb, cr, cw, ch, rw, rh, metrics, &gm,
+                    hasSparseWorkset ? &sparseWorkset : nullptr,
+                    &workspace.scratch);
             }
             if (metrics)
                 metrics->addWork(Stage::BuildAffineMaps, uint64_t(cw) * ch);
+            // These planes are dead before the full-resolution detail stage.
+            // Releasing them here lets the allocator reuse their storage.
+            gm.lc = Plane();
+            if (!needsBackProjection) {
+                cb = Plane();
+                cr = Plane();
+            }
             {
                 ScopedStageTimer timer(metrics, Stage::BuildDetail);
-                buildDetailMap(d, y, cw, ch, rw, rh, af);
+                buildDetailMap(d, y, cw, ch, rw, rh, af, metrics);
             }
             if (metrics)
                 metrics->addWork(Stage::BuildDetail, uint64_t(d->outW) * d->outH);
-            const auto ax = cachedChromaAxis(d, sw, d->outW, rw, d->shiftX);
-            const auto ay = cachedChromaAxis(d, sh, d->outH, rh, d->shiftY);
+            if (!d->bm)
+                y = Plane();
+            const auto ax = frameAxisX ? frameAxisX
+                : cachedChromaAxis(d, sw, d->outW, rw, d->shiftX);
+            const auto ay = frameAxisY ? frameAxisY
+                : cachedChromaAxis(d, sh, d->outH, rh, d->shiftY);
             const uint8_t *mp = nullptr;
             int mw = 0, mh = 0;
-            if (!trustMask.empty()) {
-                mp = trustMask.data();
+            if (hasSparseWorkset) {
+                mp = sparseWorkset.mask.data();
                 mw = sw;
                 mh = sh;
             }
             {
                 ScopedStageTimer timer(metrics, Stage::ApplyDetailTransfer);
-                detailTransfer(d, cOutU, cOutV, af, gm, *ax, *ay, mp, mw, mh);
+                detailTransfer(d, cOutU, cOutV, af, gm, *ax, *ay, mp, mw, mh,
+                               hasSparseWorkset ? &sparseWorkset : nullptr, metrics);
             }
             if (metrics)
                 metrics->addWork(Stage::ApplyDetailTransfer,
@@ -454,10 +631,19 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
     } else {
         // algo=2 guided path. Sparse mode: plain kernel everywhere, guided
         // correction only where luma structure makes it worthwhile.
-        if (!trustMask.empty()) {
+        CompressedChromaHull plainHull;
+        const bool reusePlainHull = hasSparseWorkset &&
+            !sparseWorkset.outputDenseFallback() && !d->radial &&
+            d->kernel != Kernel::Bilinear;
+        if (hasSparseWorkset) {
+            if (reusePlainHull)
+                plainHull.resize(sparseWorkset.activeOutputPixels);
             {
                 ScopedStageTimer timer(metrics, Stage::BuildBaseChroma);
-                plainChroma(d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV, metrics);
+                plainChroma(
+                    d, cb, cr, y, gm, sw, sh, cw, ch, cOutU, cOutV, metrics,
+                    reusePlainHull ? &plainHull : nullptr,
+                    reusePlainHull ? &sparseWorkset : nullptr);
             }
         }
         ChromaJob job;
@@ -475,12 +661,12 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
         job.shiftY = d->shiftY;
         job.d = d;
         job.metrics = metrics;
-        if (!trustMask.empty()) {
-            job.mask = trustMask.data();
-            job.maskW = sw;
-            job.maskH = sh;
+        if (hasSparseWorkset) {
+            job.workset = &sparseWorkset;
             job.plainU = &cOutU;
             job.plainV = &cOutV;
+            if (reusePlainHull)
+                job.plainHull = &plainHull;
         }
         {
             ScopedStageTimer timer(metrics, Stage::ApplyGuidedCorrection);
@@ -494,7 +680,7 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
 
     // Back-projection data consistency: re-downsample the reconstruction and
     // return a fraction of the residual, D_h(C + delta) ~= C_src.
-    if (d->bp > 0.0 && d->outW == sw && d->outH == sh && cw * 2 == sw && ch * 2 == sh) {
+    if (needsBackProjection) {
         ScopedStageTimer timer(metrics, Stage::BackProject);
         backProject(cOutU, cb, float(d->bp));
         backProject(cOutV, cr, float(d->bp));
@@ -502,7 +688,7 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
             metrics->addWork(Stage::BackProject, 2 * uint64_t(cw) * ch, 8 * uint64_t(cw) * ch);
     }
 
-    {
+    if (!isFloat || d->bm) {
         ScopedStageTimer timer(metrics, Stage::ConvertOutput);
         for (int p = 0; p < 2; ++p) {
             const Plane &cOut = (p == 0) ? cOutU : cOutV;
@@ -519,9 +705,10 @@ static const VSFrame *VS_CC lgcrGetFrame(int n, int activationReason, void *inst
                                        d->outW, d->outH, outScale, outOffset,
                                        0, uint16_t((1 << fmt->bitsPerSample) - 1));
         }
+        if (metrics)
+            metrics->addWork(Stage::ConvertOutput,
+                             2 * uint64_t(d->outW) * d->outH);
     }
-    if (metrics)
-        metrics->addWork(Stage::ConvertOutput, 3 * uint64_t(d->outW) * d->outH);
 
     if (metrics) {
         const auto totalNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -967,7 +1154,7 @@ static void VS_CC lgcrCreate(const VSMap *in, VSMap *out, void *, VSCore *core,
     LGCRData *data = d.release();
     VSFilterDependency deps[] = { { data->node, rpGeneral } };
     vsapi->createVideoFilter(out, "LGCR", &data->viOut, lgcrGetFrame, lgcrFree,
-                             fmParallelRequests, deps, 1, data, core);
+                             fmParallel, deps, 1, data, core);
 }
 
 VS_EXTERNAL_API(void)

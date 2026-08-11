@@ -12,8 +12,10 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -34,6 +36,8 @@ namespace lgcr {
 
 struct GeometryCache;
 std::shared_ptr<GeometryCache> makeGeometryCache();
+class FrameWorkspacePool;
+std::shared_ptr<FrameWorkspacePool> makeFrameWorkspacePool();
 
 // ---------------------------------------------------------------------------
 // Kernels
@@ -156,6 +160,7 @@ struct LGCRData {
     // Shared across frame requests, including temporary per-frame siting
     // copies. The cache is filter-instance local and internally locked.
     std::shared_ptr<GeometryCache> geometryCache = makeGeometryCache();
+    std::shared_ptr<FrameWorkspacePool> workspacePool = makeFrameWorkspacePool();
 };
 
 // ---------------------------------------------------------------------------
@@ -197,24 +202,265 @@ bool operator!=(const NoInitAllocator<T> &, const NoInitAllocator<U> &) noexcept
     return false;
 }
 
+class FrameScratchAllocator;
+
 struct Plane {
+    using Storage = std::vector<float, NoInitAllocator<float>>;
+
     int w = 0, h = 0, stride = 0;
-    std::vector<float, NoInitAllocator<float>> px;
 
     Plane() = default;
-    Plane(int w_, int h_) : w(w_), h(h_), stride(w_) { px.resize(size_t(stride) * h); }
-    float *row(int y) { return px.data() + size_t(y) * stride; }
-    const float *row(int y) const { return px.data() + size_t(y) * stride; }
+    Plane(int width, int height) { resizeDiscard(width, height); }
+    Plane(const Plane &other) { copyFrom(other); }
+    Plane &operator=(const Plane &other) {
+        if (this != &other) {
+            Plane copy(other);
+            swapState(copy);
+        }
+        return *this;
+    }
+    Plane(Plane &&other) noexcept { moveFrom(std::move(other)); }
+    Plane &operator=(Plane &&other) noexcept {
+        if (this != &other) {
+            Plane moved(std::move(other));
+            swapState(moved);
+        }
+        return *this;
+    }
+    ~Plane() { recycleStorage(); }
+
+    static Plane readOnlyView(const float *data, int width, int height,
+                              int rowStride) {
+        return Plane(data, nullptr, width, height, rowStride);
+    }
+    static Plane writableView(float *data, int width, int height,
+                              int rowStride) {
+        return Plane(data, data, width, height, rowStride);
+    }
+
+    void resizeDiscard(int width, int height) {
+        if (width < 0 || height < 0)
+            throw std::invalid_argument("negative Plane dimensions");
+        if (borrowed_) {
+            Storage detached;
+            storage_.swap(detached);
+            borrowed_ = false;
+        }
+        w = width;
+        h = height;
+        stride = width;
+        storage_.resize(size_t(stride) * h);
+        syncOwnedPointers();
+    }
+    void clear() noexcept {
+        Plane empty;
+        swapState(empty);
+    }
+    void fill(float value) {
+        for (int y = 0; y < h; ++y)
+            std::fill(row(y), row(y) + w, value);
+    }
+    void swapOwnedStorage(Plane &other) {
+        if (borrowed_ || other.borrowed_ || w != other.w || h != other.h ||
+            stride != other.stride)
+            throw std::logic_error("incompatible Plane storage swap");
+        storage_.swap(other.storage_);
+        std::swap(recycleContext_, other.recycleContext_);
+        std::swap(recycleFn_, other.recycleFn_);
+        syncOwnedPointers();
+        other.syncOwnedPointers();
+    }
+    size_t retainedBytes() const {
+        return borrowed_ ? 0 : storage_.capacity() * sizeof(float);
+    }
+    bool isView() const { return borrowed_; }
+    bool isWritable() const { return writeData_ != nullptr; }
+    float *row(int y) {
+        if (!writeData_)
+            throw std::logic_error("write access to read-only Plane view");
+        return writeData_ + size_t(y) * stride;
+    }
+    const float *row(int y) const { return readData_ + size_t(y) * stride; }
     float &at(int x, int y) {
         x = std::clamp(x, 0, w - 1);
         y = std::clamp(y, 0, h - 1);
-        return px[size_t(y) * stride + x];
+        return row(y)[x];
     }
     float at(int x, int y) const {
         x = std::clamp(x, 0, w - 1);
         y = std::clamp(y, 0, h - 1);
-        return px[size_t(y) * stride + x];
+        return row(y)[x];
     }
+
+private:
+    friend class FrameScratchAllocator;
+    using RecycleFn = void (*)(void *, Storage &&);
+
+    Plane(const float *readData, float *writeData, int width, int height,
+          int rowStride)
+        : w(width), h(height), stride(rowStride), readData_(readData),
+          writeData_(writeData), borrowed_(true) {
+        if (width < 0 || height < 0 || rowStride < width ||
+            ((width != 0 && height != 0) && !readData))
+            throw std::invalid_argument("invalid Plane view");
+    }
+    Plane(Storage storage, int width, int height, void *recycleContext,
+          RecycleFn recycleFn)
+        : w(width), h(height), stride(width), storage_(std::move(storage)),
+          recycleContext_(recycleContext), recycleFn_(recycleFn) {
+        storage_.resize(size_t(width) * height);
+        syncOwnedPointers();
+    }
+
+    void copyFrom(const Plane &other) {
+        resizeDiscard(other.w, other.h);
+        for (int y = 0; y < h; ++y)
+            std::copy_n(static_cast<const Plane &>(other).row(y), w, row(y));
+    }
+    void moveFrom(Plane &&other) noexcept {
+        w = other.w;
+        h = other.h;
+        stride = other.stride;
+        storage_ = std::move(other.storage_);
+        readData_ = other.readData_;
+        writeData_ = other.writeData_;
+        borrowed_ = other.borrowed_;
+        recycleContext_ = other.recycleContext_;
+        recycleFn_ = other.recycleFn_;
+        if (!borrowed_)
+            syncOwnedPointers();
+        other.w = other.h = other.stride = 0;
+        other.readData_ = nullptr;
+        other.writeData_ = nullptr;
+        other.borrowed_ = false;
+        other.recycleContext_ = nullptr;
+        other.recycleFn_ = nullptr;
+    }
+    void syncOwnedPointers() noexcept {
+        readData_ = storage_.empty() ? nullptr : storage_.data();
+        writeData_ = storage_.empty() ? nullptr : storage_.data();
+    }
+    void swapState(Plane &other) noexcept {
+        using std::swap;
+        swap(w, other.w);
+        swap(h, other.h);
+        swap(stride, other.stride);
+        storage_.swap(other.storage_);
+        swap(readData_, other.readData_);
+        swap(writeData_, other.writeData_);
+        swap(borrowed_, other.borrowed_);
+        swap(recycleContext_, other.recycleContext_);
+        swap(recycleFn_, other.recycleFn_);
+    }
+    void recycleStorage() noexcept {
+        if (recycleFn_ && !borrowed_ && storage_.capacity() != 0)
+            recycleFn_(recycleContext_, std::move(storage_));
+        recycleContext_ = nullptr;
+        recycleFn_ = nullptr;
+    }
+
+    Storage storage_;
+    const float *readData_ = nullptr;
+    float *writeData_ = nullptr;
+    bool borrowed_ = false;
+    void *recycleContext_ = nullptr;
+    RecycleFn recycleFn_ = nullptr;
+};
+
+class FrameScratchAllocator {
+public:
+    Plane acquire(int width, int height);
+    size_t retainedBytes() const { return retainedBytes_; }
+    size_t largestBytes() const {
+        return idle_.empty() ? 0 : idle_.rbegin()->first * sizeof(float);
+    }
+    bool releaseLargest();
+
+private:
+    static void recycleThunk(void *context, Plane::Storage &&storage) {
+        static_cast<FrameScratchAllocator *>(context)->recycle(std::move(storage));
+    }
+    void recycle(Plane::Storage &&storage);
+
+    std::map<size_t, std::vector<Plane::Storage>> idle_;
+    size_t retainedBytes_ = 0;
+};
+
+inline Plane scratchPlane(FrameScratchAllocator *scratch, int width, int height) {
+    return scratch ? scratch->acquire(width, height) : Plane(width, height);
+}
+
+struct FrameWorkspace {
+    Plane sourceY;
+    Plane sourceU;
+    Plane sourceV;
+    Plane fullSlot0;
+    Plane fullSlot1;
+    FrameScratchAllocator scratch;
+
+    size_t retainedBytes() const {
+        return sourceY.retainedBytes() + sourceU.retainedBytes() +
+               sourceV.retainedBytes() + fullSlot0.retainedBytes() +
+               fullSlot1.retainedBytes() + scratch.retainedBytes();
+    }
+    void trimTo(size_t retainedLimit) {
+        std::array<Plane *, 5> planes{{
+            &sourceY, &sourceU, &sourceV, &fullSlot0, &fullSlot1
+        }};
+        while (retainedBytes() > retainedLimit) {
+            auto largest = std::max_element(
+                planes.begin(), planes.end(), [](const Plane *left, const Plane *right) {
+                    return left->retainedBytes() < right->retainedBytes();
+                });
+            const size_t planeBytes = largest == planes.end()
+                ? 0 : (*largest)->retainedBytes();
+            if (scratch.largestBytes() > planeBytes) {
+                if (!scratch.releaseLargest())
+                    break;
+                continue;
+            }
+            if (planeBytes == 0)
+                break;
+            (*largest)->clear();
+        }
+    }
+};
+
+class FrameWorkspaceLease;
+
+class FrameWorkspacePool : public std::enable_shared_from_this<FrameWorkspacePool> {
+public:
+    explicit FrameWorkspacePool(size_t idleBudgetBytes);
+    FrameWorkspaceLease acquire(int workerCount);
+
+private:
+    friend class FrameWorkspaceLease;
+    void release(std::unique_ptr<FrameWorkspace> workspace);
+
+    std::mutex mutex_;
+    std::vector<std::unique_ptr<FrameWorkspace>> idle_;
+    size_t idleBytes_ = 0;
+    size_t idleBudgetBytes_ = 0;
+    int workerLimit_ = 1;
+};
+
+class FrameWorkspaceLease {
+public:
+    FrameWorkspaceLease() = default;
+    FrameWorkspaceLease(FrameWorkspaceLease &&) noexcept = default;
+    FrameWorkspaceLease &operator=(FrameWorkspaceLease &&) noexcept = default;
+    ~FrameWorkspaceLease();
+
+    FrameWorkspace &get() const { return *workspace_; }
+
+private:
+    friend class FrameWorkspacePool;
+    FrameWorkspaceLease(std::shared_ptr<FrameWorkspacePool> pool,
+                        std::unique_ptr<FrameWorkspace> workspace)
+        : pool_(std::move(pool)), workspace_(std::move(workspace)) {}
+
+    std::shared_ptr<FrameWorkspacePool> pool_;
+    std::unique_ptr<FrameWorkspace> workspace_;
 };
 
 // Bilinear sample of a plane at fractional position (coords in sample units)
@@ -301,21 +547,30 @@ struct GuideMaps {
     Plane jyy;  //   coherence come from the eigensystem, not raw gradients.
     Plane lc;   // chroma-res luma level of each chroma sample (footprint average)
     Plane ms;   // chroma-res mutual-structure co-edge gate [0,1] (empty if off)
+    std::vector<uint8_t> trustSeed; // optional tensor-energy seed generated hot
 };
+
+struct SparseWorkset;
 
 GuideMaps buildGuideMaps(const Plane &structY, const Plane &lcY, int cw, int ch,
                          double rw, double rh, double shiftX, double shiftY,
-                         PipelineMetrics *metrics = nullptr);
+                         PipelineMetrics *metrics = nullptr,
+                         double trustSigma = -1.0,
+                         FrameScratchAllocator *scratch = nullptr);
 
 // Mutual-structure co-edge gate at chroma res (maps.cpp). rho-correlation of
 // luma/chroma gradient profiles along the luma edge normal; 1 = confirmed
 // co-edge (direction + position + width agree), 0 = no chroma-side evidence.
 Plane buildMutualGate(const Plane &lc, const Plane &U, const Plane &V, double sigma,
-                      const uint8_t *activeMask = nullptr, int activeStride = 0);
+                      const uint8_t *activeMask = nullptr, int activeStride = 0,
+                      const SparseWorkset *workset = nullptr,
+                      PipelineMetrics *metrics = nullptr,
+                      FrameScratchAllocator *scratch = nullptr);
 
 // Footprint-averaged luma at each chroma sample (standalone, for TRecon).
 Plane buildLcMap(const Plane &lcY, int cw, int ch, double rw, double rh,
-                 double shiftX, double shiftY);
+                 double shiftX, double shiftY,
+                 FrameScratchAllocator *scratch = nullptr);
 
 // Candidate encoder degradation D^(Y) to the chroma grid:
 // kind 0 = box footprint (== buildLcMap), 1 = triangle/bilinear, 2 = bicubic.
@@ -327,11 +582,17 @@ std::array<Plane, 3> buildYcMaps(const LGCRData *owner, const Plane &Y, int cw, 
                                  double shiftX, double shiftY,
                                  PipelineMetrics *metrics = nullptr);
 
+std::array<Plane, 2> buildYcFilteredMaps(
+    const LGCRData *owner, const Plane &Y, int cw, int ch, double rw, double rh,
+    double shiftX, double shiftY, PipelineMetrics *metrics = nullptr,
+    FrameScratchAllocator *scratch = nullptr);
+
 // Sparse trust mask: 1 where the output pixel's support window may touch a
 // luma structure worth guiding by (tensor energy over threshold), dilated by
 // the support radius. 0 = plain kernel is provably sufficient.
 std::vector<uint8_t> buildTrustMask(const GuideMaps &gm, int outW, int outH,
-                                    double sigma, int dilateRadius);
+                                    double sigma, int dilateRadius,
+                                    PipelineMetrics *metrics = nullptr);
 
 // ---------------------------------------------------------------------------
 // Resampling (kernels.cpp)
@@ -408,6 +669,33 @@ void resampleRadial(const Plane &src, Plane &dst, const LGCRData &d);
 
 struct TemporalNbr;
 struct LGFMaps;
+struct SparseWorkset;
+
+struct CompressedSelector {
+    std::vector<float> guidedDeltaU;
+    std::vector<float> guidedDeltaV;
+    std::vector<float> w3;
+
+    void resize(size_t size) {
+        guidedDeltaU.resize(size);
+        guidedDeltaV.resize(size);
+        w3.resize(size);
+    }
+};
+
+struct CompressedChromaHull {
+    std::vector<float> minimumU;
+    std::vector<float> maximumU;
+    std::vector<float> minimumV;
+    std::vector<float> maximumV;
+
+    void resize(size_t size) {
+        minimumU.resize(size);
+        maximumU.resize(size);
+        minimumV.resize(size);
+        maximumV.resize(size);
+    }
+};
 
 struct ChromaJob {
     const Plane *srcU, *srcV;  // source chroma (chroma res)
@@ -420,6 +708,12 @@ struct ChromaJob {
     const LGCRData *d;
     const LGFMaps *selectorMaps = nullptr; // optional fused algo4 selector
     float selectorStrength = 0.0f;
+    Plane *selectorW2 = nullptr; // algo4 routing weights, output resolution
+    Plane *selectorW3 = nullptr;
+    CompressedSelector *compressedSelector = nullptr;
+    const CompressedChromaHull *plainHull = nullptr;
+    bool selectorMetadata = false;
+    const SparseWorkset *workset = nullptr; // shared sparse mask/spans when available
     const uint8_t *mask = nullptr; // sparse trust mask (SOURCE luma res, row-major);
     int maskW = 0, maskH = 0;      //   mask dimensions (indexed by mapped coords)
     const Plane *plainU = nullptr; //   pixels with mask==0 keep plainU/plainV
@@ -459,6 +753,42 @@ struct ChromaAxis {
     BilinAxis chromaBilin;     // pos mapped to the source chroma grid
     BilinAxis lumaBilin;       // lpos mapped to the source luma grid
 };
+
+struct SparseSpan {
+    int begin = 0;
+    int end = 0;
+};
+
+// Per-frame sparse routing shared by mutual gating and all Recon algorithms.
+// The full-resolution mask owns the quality decision; projected spans and
+// indices are traversal accelerators and never broaden the corrected output.
+struct SparseWorkset {
+    int maskWidth = 0, maskHeight = 0;
+    int outputWidth = 0, outputHeight = 0;
+    int chromaWidth = 0, chromaHeight = 0;
+    std::vector<uint8_t> mask;
+    std::vector<SparseSpan> outputSpans;
+    std::vector<size_t> outputRowOffsets;
+    std::vector<size_t> outputIndexRowOffsets;
+    std::vector<uint32_t> outputIndices;
+    std::vector<uint8_t> chromaMask;
+    std::vector<SparseSpan> chromaSpans;
+    std::vector<size_t> chromaRowOffsets;
+    size_t activeOutputPixels = 0;
+    size_t activeChromaPixels = 0;
+
+    bool outputDenseFallback() const {
+        return activeOutputPixels * 2 >= size_t(outputWidth) * outputHeight;
+    }
+    bool chromaDenseFallback() const {
+        return activeChromaPixels * 2 >= size_t(chromaWidth) * chromaHeight;
+    }
+};
+
+SparseWorkset buildSparseWorkset(std::vector<uint8_t> mask, int maskWidth,
+                                 int maskHeight, int outputWidth, int outputHeight,
+                                 const ChromaAxis &ax, const ChromaAxis &ay,
+                                 int chromaWidth, int chromaHeight);
 
 struct RadialWeightTable {
     int supportX = 0, supportY = 0;
@@ -501,10 +831,17 @@ void plainChroma(const LGCRData *d, const Plane &cb, const Plane &cr,
                  const Plane &y, const GuideMaps &gm,
                  int sw, int sh, int cw, int ch,
                  Plane &cOutU, Plane &cOutV,
-                 PipelineMetrics *metrics = nullptr);
+                 PipelineMetrics *metrics = nullptr,
+                 CompressedChromaHull *hull = nullptr,
+                 const SparseWorkset *workset = nullptr);
 
 void plainPlane(const LGCRData *d, const Plane &src,
                 int sw, int sh, int cw, int ch, Plane &dst);
+
+using PlainPlaneRowSink = void (*)(void *context, int y, const float *row);
+void plainPlaneRows(const LGCRData *d, const Plane &src,
+                    int sw, int sh, int cw, int ch,
+                    PlainPlaneRowSink sink, void *context);
 
 // ---------------------------------------------------------------------------
 // Alternative algorithms (algos.cpp)
@@ -526,10 +863,14 @@ void buildLGFPair(const Plane &Y, int cw, int ch, double rw, double rh,
                   double shiftX, double shiftY, const Plane &U, const Plane &V,
                   int radius, double eps,
                   Plane &aU, Plane &bU, Plane &confU,
-                  Plane &aV, Plane &bV, Plane &confV, bool cedge);
+                  Plane &aV, Plane &bV, Plane &confV, bool cedge,
+                  const uint8_t *roiMask = nullptr, int roiStride = 0);
 
 LGFMaps buildLGFMaps(const LGCRData *d, const Plane &y, const Plane &cb,
-                     const Plane &cr, int cw, int ch, double rw, double rh);
+                     const Plane &cr, int cw, int ch, double rw, double rh,
+                     PipelineMetrics *metrics = nullptr,
+                     const uint8_t *roiMask = nullptr, int roiStride = 0,
+                     FrameScratchAllocator *scratch = nullptr);
 
 void blendSelector(Plane &outU, Plane &outV,
                    const Plane &gU, const Plane &gV,
@@ -537,7 +878,19 @@ void blendSelector(Plane &outU, Plane &outV,
                    const Plane &confU, const Plane &confV, const Plane &Y,
                    const ChromaAxis &ax, const ChromaAxis &ay,
                    const Plane &w2, const Plane &w3,
-                   int cw, int ch, float lam);
+                   int cw, int ch, float lam,
+                   const SparseWorkset *workset = nullptr,
+                   PipelineMetrics *metrics = nullptr);
+
+void blendSelectorCompressed(Plane &outU, Plane &outV,
+                             const CompressedSelector &selector,
+                             const Plane &aU, const Plane &bU,
+                             const Plane &aV, const Plane &bV,
+                             const Plane &confU, const Plane &confV,
+                             const Plane &Y, const ChromaAxis &ax,
+                             const ChromaAxis &ay,
+                             const SparseWorkset &workset, float lam,
+                             PipelineMetrics *metrics = nullptr);
 
 void backProject(Plane &cOut, const Plane &cSrc, float bp);
 
@@ -568,15 +921,21 @@ struct AffineMaps {
 
 AffineMaps buildAffineMaps(const LGCRData *d, const Plane &y, const Plane &cb,
                            const Plane &cr, int cw, int ch, double rw, double rh,
-                           PipelineMetrics *metrics = nullptr);
+                           PipelineMetrics *metrics = nullptr,
+                           const GuideMaps *guideMaps = nullptr,
+                           const SparseWorkset *workset = nullptr,
+                           FrameScratchAllocator *scratch = nullptr);
 
 void buildDetailMap(const LGCRData *d, const Plane &y, int cw, int ch,
-                    double rw, double rh, AffineMaps &maps);
+                    double rw, double rh, AffineMaps &maps,
+                    PipelineMetrics *metrics = nullptr);
 
 void detailTransfer(const LGCRData *d, Plane &outU, Plane &outV,
                     const AffineMaps &af, const GuideMaps &gm,
                     const ChromaAxis &ax, const ChromaAxis &ay,
-                    const uint8_t *mask, int maskW, int maskH);
+                    const uint8_t *mask, int maskW, int maskH,
+                    const SparseWorkset *workset = nullptr,
+                    PipelineMetrics *metrics = nullptr);
 
 // Integer-pel luma block matching (TRecon). Fills mvx/mvy/conf on a
 // blockSize grid; conf = matchQuality x observability, where observability

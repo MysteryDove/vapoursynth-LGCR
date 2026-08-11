@@ -135,6 +135,15 @@ def test_algo4_sparse_ramp():
     print("algo4 weak-ramp sparse equivalence: OK")
 
 
+def test_algo6_sparse_affine_roi():
+    source = edge_clip(256, 96, F420)
+    options = dict(kernel="lanczos", taps=3, algo=6, strength=0.8)
+    dense = core.lgcr.Recon(source, sparse=0, **options).get_frame(0)
+    sparse = core.lgcr.Recon(source, sparse=1, **options).get_frame(0)
+    assert max_diff(dense, sparse) <= 1e-6, "algo6 sparse affine ROI mismatch"
+    print("algo6 sparse affine ROI equivalence: OK")
+
+
 def test_scalar_avx_matrix():
     for fmt, label in ((F420, "420"), (F422, "422"), (F444, "444")):
         source = edge_clip(48, 32, fmt)
@@ -194,6 +203,7 @@ test_degenerate_and_boundaries()
 test_formats_and_siting()
 test_strength_and_sparse()
 test_algo4_sparse_ramp()
+test_algo6_sparse_affine_roi()
 test_scalar_avx_matrix()
 test_scaled_separable_cache()
 test_bilinear_fast_and_fallback()

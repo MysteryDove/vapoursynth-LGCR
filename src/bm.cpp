@@ -272,9 +272,9 @@ void collaborativeChromaFilter(const Plane &guide, Plane &u, Plane &v,
     u = Plane(sourceU.w, sourceU.h);
     v = Plane(sourceV.w, sourceV.h);
     Plane weights(sourceU.w, sourceU.h);
-    std::fill(u.px.begin(), u.px.end(), 0.0f);
-    std::fill(v.px.begin(), v.px.end(), 0.0f);
-    std::fill(weights.px.begin(), weights.px.end(), 0.0f);
+    u.fill(0.0f);
+    v.fill(0.0f);
+    weights.fill(0.0f);
 
     const std::vector<int> startsX = blockStarts(sourceU.w);
     const std::vector<int> startsY = blockStarts(sourceU.h);
